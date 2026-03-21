@@ -522,14 +522,34 @@ struct AudioInput<'a> {
     sample_rate: u32,
 }
 
-fn spawn_ffmpeg(
-    ffmpeg_path: &Path,
+#[cfg(test)]
+fn frame_interval(fps: u64) -> Duration {
+    Duration::from_micros(1_000_000 / fps)
+}
+
+#[cfg(test)]
+fn choose_monitor_target(
+    monitor_setting: &str,
+    auto_monitor: Option<usize>,
+    available_monitors: usize,
+) -> usize {
+    match monitor_setting {
+        "auto" => auto_monitor.unwrap_or(1),
+        index_str => index_str
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index >= 1 && *index <= available_monitors)
+            .unwrap_or(1),
+    }
+}
+
+fn build_ffmpeg_args(
     width: u32,
     height: u32,
     seg_dir: &Path,
     cfg: &CaptureConfig,
     audio: Option<AudioInput<'_>>,
-) -> Result<Child> {
+) -> Vec<String> {
     let seg_pattern = seg_dir
         .join("seg_%04d.mp4")
         .to_string_lossy()
@@ -537,7 +557,6 @@ fn spawn_ffmpeg(
 
     let mut args: Vec<String> = vec!["-y".into()];
 
-    // Video input (rawvideo on stdin)
     args.extend([
         "-f".into(),
         "rawvideo".into(),
@@ -551,7 +570,6 @@ fn spawn_ffmpeg(
         "pipe:0".into(),
     ]);
 
-    // Audio input (raw f32le from named pipe)
     if let Some(ref ai) = audio {
         args.extend([
             "-f".into(),
@@ -565,7 +583,6 @@ fn spawn_ffmpeg(
         ]);
     }
 
-    // Video filter + codec
     args.extend([
         "-vf".into(),
         cfg.scale.clone(),
@@ -579,12 +596,10 @@ fn spawn_ffmpeg(
         cfg.quality.clone(),
     ]);
 
-    // Audio codec (only when we have audio input)
     if audio.is_some() {
         args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "128k".into()]);
     }
 
-    // Segment output
     args.extend([
         "-f".into(),
         "segment".into(),
@@ -596,6 +611,19 @@ fn spawn_ffmpeg(
         "mp4".into(),
         seg_pattern,
     ]);
+
+    args
+}
+
+fn spawn_ffmpeg(
+    ffmpeg_path: &Path,
+    width: u32,
+    height: u32,
+    seg_dir: &Path,
+    cfg: &CaptureConfig,
+    audio: Option<AudioInput<'_>>,
+) -> Result<Child> {
+    let args = build_ffmpeg_args(width, height, seg_dir, cfg, audio);
 
     log(&format!("[snapple] ffmpeg args: {}", args.join(" ")));
 
@@ -609,4 +637,70 @@ fn spawn_ffmpeg(
         .context("Failed to spawn ffmpeg — is it installed and on PATH?")?;
 
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_ffmpeg_args, choose_monitor_target, frame_interval, AudioInput};
+    use crate::config::CaptureConfig;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn uses_declared_fps_for_real_time_pacing() {
+        assert_eq!(frame_interval(60), Duration::from_micros(16_666));
+        assert_eq!(frame_interval(30), Duration::from_micros(33_333));
+    }
+
+    #[test]
+    fn ffmpeg_args_preserve_aspect_ratio_and_declared_speed() {
+        let cfg = CaptureConfig {
+            fps: 60,
+            scale: "scale=-2:720".into(),
+            encoder: "h264_nvenc".into(),
+            preset: "p4".into(),
+            rate_control: "constqp".into(),
+            quality: "28".into(),
+            segment_time: 5,
+            monitor: "auto".into(),
+            microphone: "default".into(),
+        };
+
+        let args = build_ffmpeg_args(2560, 1440, Path::new("C:/temp"), &cfg, None);
+
+        assert!(args.windows(2).any(|w| w == ["-vf", "scale=-2:720"]));
+        assert!(args.windows(2).any(|w| w == ["-r", "60"]));
+        assert!(args.windows(2).any(|w| w == ["-s", "2560x1440"]));
+    }
+
+    #[test]
+    fn ffmpeg_args_include_audio_pipe_when_audio_is_enabled() {
+        let cfg = CaptureConfig::default();
+        let args = build_ffmpeg_args(
+            1920,
+            1080,
+            Path::new("C:/temp"),
+            &cfg,
+            Some(AudioInput {
+                pipe_path: r"\\.\pipe\snapple_audio_42",
+                sample_rate: 48_000,
+            }),
+        );
+
+        assert!(args.windows(2).any(|w| w == ["-ar", "48000"]));
+        assert!(args.windows(2).any(|w| w == ["-ac", "2"]));
+        assert!(args.windows(2).any(|w| w == ["-i", r"\\.\pipe\snapple_audio_42"]));
+        assert!(args.windows(2).any(|w| w == ["-c:a", "aac"]));
+    }
+
+    #[test]
+    fn auto_monitor_prefers_game_window_monitor() {
+        assert_eq!(choose_monitor_target("auto", Some(2), 3), 2);
+    }
+
+    #[test]
+    fn invalid_or_out_of_range_monitor_falls_back_to_primary() {
+        assert_eq!(choose_monitor_target("99", Some(2), 3), 1);
+        assert_eq!(choose_monitor_target("bogus", Some(2), 3), 1);
+    }
 }

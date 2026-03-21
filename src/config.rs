@@ -178,3 +178,51 @@ pub fn parse_hotkey_code(name: &str) -> Option<Code> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_hotkey_code, BufferConfig, CaptureConfig, Config};
+    use global_hotkey::hotkey::Code;
+
+    #[test]
+    fn cleanup_age_keeps_one_extra_segment() {
+        let cfg = Config {
+            buffer: BufferConfig { segments: 12 },
+            capture: CaptureConfig {
+                segment_time: 5,
+                ..CaptureConfig::default()
+            },
+            ..Config::default()
+        };
+
+        assert_eq!(cfg.cleanup_age_secs(), 65);
+    }
+
+    #[test]
+    fn quality_flag_matches_rate_control_mode() {
+        let cfg = CaptureConfig {
+            rate_control: "crf".into(),
+            ..CaptureConfig::default()
+        };
+        assert_eq!(cfg.quality_flag(), "-crf");
+
+        let cfg = CaptureConfig {
+            rate_control: "vbr".into(),
+            ..CaptureConfig::default()
+        };
+        assert_eq!(cfg.quality_flag(), "-b:v");
+
+        let cfg = CaptureConfig {
+            rate_control: "constqp".into(),
+            ..CaptureConfig::default()
+        };
+        assert_eq!(cfg.quality_flag(), "-qp");
+    }
+
+    #[test]
+    fn parses_supported_hotkeys_case_insensitively() {
+        assert_eq!(parse_hotkey_code("f8"), Some(Code::F8));
+        assert_eq!(parse_hotkey_code("PrintScreen"), Some(Code::PrintScreen));
+        assert_eq!(parse_hotkey_code("unknown"), None);
+    }
+}

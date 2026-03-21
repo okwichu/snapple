@@ -103,6 +103,31 @@ fn load_steam_games(steam_path: &Path, skip_appids: &[String]) -> Vec<(String, S
 pub enum GameEvent {
     Started { name: String, pid: u32 },
     Stopped,
+    /// A different game replaced the currently tracked one.
+    /// The receiver should stop the old capture, then start the new one.
+    Switched { name: String, pid: u32 },
+}
+
+fn next_game_event(
+    current: Option<(&str, u32)>,
+    detected: Option<(&str, u32)>,
+) -> Option<GameEvent> {
+    match (current, detected) {
+        (None, Some((name, pid))) => Some(GameEvent::Started {
+            name: name.to_string(),
+            pid,
+        }),
+        (Some((cur_name, cur_pid)), Some((name, pid)))
+            if cur_name != name || cur_pid != pid =>
+        {
+            Some(GameEvent::Switched {
+                name: name.to_string(),
+                pid,
+            })
+        }
+        (Some(_), None) => Some(GameEvent::Stopped),
+        _ => None,
+    }
 }
 
 /// Polls running processes to detect Steam games.
@@ -110,7 +135,7 @@ pub fn spawn_monitor(tx: mpsc::Sender<GameEvent>, steam_cfg: SteamConfig) -> thr
     thread::spawn(move || {
         let games = load_steam_games(&steam_cfg.path, &steam_cfg.skip_appids);
         let marker = "steamapps\\common\\";
-        let mut current_game: Option<String> = None;
+        let mut current_game: Option<(String, u32)> = None;
         let mut sys = System::new();
 
         loop {
@@ -141,22 +166,73 @@ pub fn spawn_monitor(tx: mpsc::Sender<GameEvent>, steam_cfg: SteamConfig) -> thr
                 }
             }
 
-            match (&current_game, &detected) {
-                (None, Some((name, pid))) => {
-                    current_game = Some(name.clone());
-                    let _ = tx.send(GameEvent::Started {
-                        name: name.clone(),
-                        pid: *pid,
-                    });
+            if let Some(event) = next_game_event(
+                current_game.as_ref().map(|(name, pid)| (name.as_str(), *pid)),
+                detected.as_ref().map(|(name, pid)| (name.as_str(), *pid)),
+            ) {
+                match &event {
+                    GameEvent::Started { name, pid } | GameEvent::Switched { name, pid } => {
+                        current_game = Some((name.clone(), *pid));
+                    }
+                    GameEvent::Stopped => {
+                        current_game = None;
+                    }
                 }
-                (Some(_), None) => {
-                    current_game = None;
-                    let _ = tx.send(GameEvent::Stopped);
-                }
-                _ => {}
+                let _ = tx.send(event);
             }
 
             thread::sleep(Duration::from_secs(steam_cfg.poll_interval_secs));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_game_event, parse_kv_pairs, GameEvent};
+
+    #[test]
+    fn parses_vdf_key_value_pairs() {
+        let text = "\"libraryfolders\"\n{\n    \"0\"\n    {\n        \"path\"    \"D:\\\\SteamLibrary\"\n    }\n}";
+        let pairs = parse_kv_pairs(text);
+        assert!(pairs.iter().any(|(k, v)| k == "path" && v == r"D:\\SteamLibrary"));
+    }
+
+    #[test]
+    fn emits_started_when_first_game_appears() {
+        let event = next_game_event(None, Some(("Game A", 101)));
+        assert!(matches!(
+            event,
+            Some(GameEvent::Started { name, pid }) if name == "Game A" && pid == 101
+        ));
+    }
+
+    #[test]
+    fn emits_switch_when_different_game_is_detected() {
+        let event = next_game_event(Some(("Game A", 101)), Some(("Game B", 202)));
+        assert!(matches!(
+            event,
+            Some(GameEvent::Switched { name, pid }) if name == "Game B" && pid == 202
+        ));
+    }
+
+    #[test]
+    fn emits_switch_when_same_game_restarts_with_new_pid() {
+        let event = next_game_event(Some(("Game A", 101)), Some(("Game A", 202)));
+        assert!(matches!(
+            event,
+            Some(GameEvent::Switched { name, pid }) if name == "Game A" && pid == 202
+        ));
+    }
+
+    #[test]
+    fn emits_stopped_when_last_game_closes() {
+        let event = next_game_event(Some(("Game A", 101)), None);
+        assert!(matches!(event, Some(GameEvent::Stopped)));
+    }
+
+    #[test]
+    fn emits_nothing_when_same_game_and_pid_remain() {
+        let event = next_game_event(Some(("Game A", 101)), Some(("Game A", 101)));
+        assert!(event.is_none());
+    }
 }

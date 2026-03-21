@@ -147,10 +147,14 @@ fn run() -> Result<()> {
         // Handle game detection events
         while let Ok(event) = game_rx.try_recv() {
             match event {
-                games::GameEvent::Started { name, pid } => {
+                games::GameEvent::Started { name, pid }
+                | games::GameEvent::Switched { name, pid } => {
                     log(&format!("[snapple] game detected: {name} (pid {pid})"));
-                    current_game = Some(name.clone());
-                    status_item.set_text(format!("Snapple \u{2014} Recording {name}"));
+
+                    // Stop any existing capture first (handles game-to-game switches).
+                    if let Some(mut session) = capture_session.take() {
+                        session.stop();
+                    }
 
                     match capture::CaptureSession::start(
                         seg_dir.clone(),
@@ -161,9 +165,14 @@ fn run() -> Result<()> {
                     ) {
                         Ok(session) => {
                             capture_session = Some(session);
+                            current_game = Some(name.clone());
+                            status_item.set_text(format!("Snapple \u{2014} Recording {name}"));
                             log("[snapple] capture started");
                         }
                         Err(e) => {
+                            // Capture failed — don't claim we're recording.
+                            current_game = None;
+                            status_item.set_text("Snapple \u{2014} Idle");
                             log(&format!("[snapple] failed to start capture: {e:#}"));
                         }
                     }
@@ -192,28 +201,30 @@ fn run() -> Result<()> {
             }
         }
 
-        // Handle hotkey
+        // Handle hotkey — only save if there is an active capture session.
         if let Ok(_event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if let Some(game) = current_game.as_deref() {
-                log(&format!(
-                    "[snapple] {} pressed — saving clip for {game}",
-                    cfg.hotkey
-                ));
-                sound::play_shutter(&shutter_wav);
+            if capture_session.is_some() {
+                if let Some(game) = current_game.as_deref() {
+                    log(&format!(
+                        "[snapple] {} pressed — saving clip for {game}",
+                        cfg.hotkey
+                    ));
+                    sound::play_shutter(&shutter_wav);
 
-                match buffer::save_clip(
-                    &seg_dir,
-                    game,
-                    &ffmpeg_path,
-                    &cfg.clips_dir,
-                    cfg.buffer.segments,
-                ) {
-                    Ok(path) => log(&format!("[snapple] clip saved: {}", path.display())),
-                    Err(e) => log(&format!("[snapple] save failed: {e:#}")),
+                    match buffer::save_clip(
+                        &seg_dir,
+                        game,
+                        &ffmpeg_path,
+                        &cfg.clips_dir,
+                        cfg.buffer.segments,
+                    ) {
+                        Ok(path) => log(&format!("[snapple] clip saved: {}", path.display())),
+                        Err(e) => log(&format!("[snapple] save failed: {e:#}")),
+                    }
                 }
             } else {
                 log(&format!(
-                    "[snapple] {} pressed but no game is running",
+                    "[snapple] {} pressed but no active capture",
                     cfg.hotkey
                 ));
             }

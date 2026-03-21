@@ -13,6 +13,7 @@ use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Pipes::*;
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 
 use crate::log;
@@ -56,7 +57,7 @@ impl AudioPipe {
             CreateNamedPipeW(
                 PCWSTR(pipe_wide.as_ptr()),
                 FILE_FLAGS_AND_ATTRIBUTES(2), // PIPE_ACCESS_OUTBOUND
-                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PIPE_TYPE_BYTE | PIPE_NOWAIT,  // non-blocking for ConnectNamedPipe polling
                 1,     // max instances
                 65536, // out buffer
                 0,     // in buffer (unused for outbound)
@@ -298,9 +299,32 @@ fn audio_thread(
         None
     };
 
-    // Block until ffmpeg connects to the named pipe.
-    let _ = unsafe { ConnectNamedPipe(pipe, None) };
+    // Poll for ffmpeg to connect, checking `running` so we can exit if
+    // ffmpeg fails to spawn or crashes before opening the pipe.
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            log("[snapple] audio: shutdown before ffmpeg connected");
+            unsafe { let _ = CloseHandle(pipe); }
+            return Ok(());
+        }
+        match unsafe { ConnectNamedPipe(pipe, None) } {
+            Ok(()) => break,
+            Err(e) => {
+                // ERROR_PIPE_CONNECTED (0x80070217) — client already connected.
+                if e.code().0 as u32 == 0x80070217 {
+                    break;
+                }
+                // With PIPE_NOWAIT, ERROR_PIPE_LISTENING (0x80070224) means
+                // no client yet — keep polling.
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
     log("[snapple] audio pipe connected to ffmpeg");
+
+    // Switch the pipe to blocking mode for reliable writes.
+    let wait_mode = PIPE_WAIT;
+    unsafe { let _ = SetNamedPipeHandleState(pipe, Some(&wait_mode), None, None); }
 
     // Wrap the raw HANDLE in a File for convenient writing.
     // Ownership transfers here — File::drop will call CloseHandle.

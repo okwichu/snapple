@@ -40,3 +40,6 @@ windows = { version = "0.62.2", features = [
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
 ] }
+
+[dev-dependencies]
+tempfile = "3"

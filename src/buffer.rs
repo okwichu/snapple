@@ -120,3 +120,46 @@ fn sanitize_filename(name: &str) -> String {
         .trim()
         .replace(' ', "_")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{cleanup_old_segments, list_segments, sanitize_filename};
+    use std::fs;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    #[test]
+    fn segment_listing_is_sorted_oldest_first() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.mp4");
+        let b = dir.path().join("b.mp4");
+        fs::write(&a, b"a").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&b, b"b").unwrap();
+
+        let segments = list_segments(dir.path()).unwrap();
+        let names: Vec<_> = segments
+            .iter()
+            .map(|(_, path)| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.mp4", "b.mp4"]);
+    }
+
+    #[test]
+    fn cleanup_with_zero_age_removes_all_existing_segments() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.mp4"), b"a").unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        cleanup_old_segments(dir.path(), 0).unwrap();
+
+        let segments = list_segments(dir.path()).unwrap();
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn sanitize_filename_keeps_safe_characters_and_normalizes_spaces() {
+        assert_eq!(sanitize_filename("Halo Infinite"), "Halo_Infinite");
+        assert_eq!(sanitize_filename("Risk: Rain/2?"), "Risk_Rain2");
+    }
+}
