@@ -2,7 +2,7 @@ use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -131,8 +131,19 @@ fn capture_thread(
     // Start capture
     session.StartCapture()?;
 
+    // Shared counter: the capture loop increments this after each frame
+    // write so the audio thread can pace its output to match the video
+    // clock, preventing A/V desync when encoding back-pressure slows
+    // the video pipe below the declared fps.
+    let video_frames = Arc::new(AtomicU64::new(0));
+
     // Start audio capture (best-effort — video continues even if audio fails)
-    let audio_pipe = match audio::AudioPipe::start(&capture_cfg.microphone, running.clone()) {
+    let audio_pipe = match audio::AudioPipe::start(
+        &capture_cfg.microphone,
+        running.clone(),
+        video_frames.clone(),
+        capture_cfg.fps,
+    ) {
         Ok(ap) => {
             log(&format!(
                 "[snapple] audio capture started ({}Hz stereo)",
@@ -151,6 +162,7 @@ fn capture_thread(
         .as_ref()
         .map(|ap| AudioInput { pipe_path: &ap.pipe_path, sample_rate: ap.sample_rate });
     let mut ffmpeg = spawn_ffmpeg(ffmpeg_path, width, height, seg_dir, capture_cfg, audio_input)?;
+    drain_ffmpeg_stderr(&mut ffmpeg);
     let mut stdin = ffmpeg.stdin.take().context("No ffmpeg stdin")?;
 
     let frame_interval = Duration::from_micros(1_000_000 / capture_cfg.fps);
@@ -256,6 +268,7 @@ fn capture_thread(
                 log("[snapple] ffmpeg pipe broken, stopping capture");
                 break;
             }
+            video_frames.fetch_add(1, Ordering::Relaxed);
         }
 
         // Frame pacing
@@ -308,6 +321,21 @@ fn create_capture_item(
 
     // Try direct window capture.
     if let Some(h) = hwnd {
+        // Log details about the window we found.
+        let mut title_buf = [0u16; 256];
+        let title_len = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(h, &mut title_buf)
+        } as usize;
+        let title = String::from_utf16_lossy(&title_buf[..title_len]);
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(h, &mut rect) };
+        log(&format!(
+            "[snapple] found game window: hwnd={:?} title=\"{title}\" client={}x{}",
+            h.0,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        ));
+
         match create_window_capture_item(h) {
             Ok(item) => {
                 log("[snapple] using direct window capture");
@@ -676,12 +704,32 @@ fn spawn_ffmpeg(
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .context("Failed to spawn ffmpeg — is it installed and on PATH?")?;
 
     Ok(child)
+}
+
+/// Drain ffmpeg stderr in a background thread and log interesting lines.
+fn drain_ffmpeg_stderr(child: &mut Child) {
+    use std::io::{BufRead, BufReader};
+
+    if let Some(stderr) = child.stderr.take() {
+        thread::Builder::new()
+            .name("ffmpeg-stderr".into())
+            .spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if !l.is_empty() => log(&format!("[ffmpeg] {l}")),
+                        _ => break,
+                    }
+                }
+            })
+            .ok();
+    }
 }
 
 #[cfg(test)]

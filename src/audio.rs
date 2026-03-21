@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -46,7 +46,12 @@ pub struct AudioPipe {
 impl AudioPipe {
     /// Create the named pipe and spawn the audio capture thread.
     /// Call **before** spawning ffmpeg so the pipe path exists when ffmpeg opens it.
-    pub fn start(mic_device: &str, running: Arc<AtomicBool>) -> Result<Self> {
+    pub fn start(
+        mic_device: &str,
+        running: Arc<AtomicBool>,
+        video_frames: Arc<AtomicU64>,
+        video_fps: u64,
+    ) -> Result<Self> {
         // Probe loopback sample rate on this thread so we can return it to the caller.
         let sample_rate = detect_loopback_sample_rate()?;
 
@@ -75,7 +80,9 @@ impl AudioPipe {
         let thread = thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
-                if let Err(e) = audio_thread(handle, &mic, sample_rate, &running) {
+                if let Err(e) =
+                    audio_thread(handle, &mic, sample_rate, &running, &video_frames, video_fps)
+                {
                     log(&format!("[snapple] audio error: {e:#}"));
                 }
             })
@@ -268,6 +275,8 @@ fn audio_thread(
     mic_device: &str,
     target_rate: u32,
     running: &AtomicBool,
+    video_frames: &AtomicU64,
+    video_fps: u64,
 ) -> Result<()> {
     let pipe = pipe.0;
 
@@ -347,6 +356,12 @@ fn audio_thread(
     let mut mic_resampled_buf = Vec::<f32>::new();
     let mut write_buf = Vec::<u8>::new();
 
+    // Audio samples waiting to be sent — buffered here so we can
+    // throttle output to match the video frame clock.
+    let mut pending = Vec::<f32>::new();
+    // Total stereo samples (f32 pairs) written to the pipe so far.
+    let mut samples_written: u64 = 0;
+
     while running.load(Ordering::Relaxed) {
         // --- loopback ---
         drain_samples_into(&loopback, &mut lb_raw);
@@ -376,34 +391,48 @@ fn audio_thread(
             &[]
         };
 
-        // --- mix & write ---
+        // --- mix into pending buffer ---
         let len = lb.len().max(mic_data.len());
         if len > 0 {
-            write_buf.resize(len * 4, 0);
+            let base = pending.len();
+            pending.resize(base + len, 0.0);
 
-            // Overlapping region: mix both sources.
             let overlap = lb.len().min(mic_data.len());
             for i in 0..overlap {
-                let mixed = (lb[i] + mic_data[i]).clamp(-1.0, 1.0);
-                write_buf[i * 4..i * 4 + 4].copy_from_slice(&mixed.to_le_bytes());
+                pending[base + i] = (lb[i] + mic_data[i]).clamp(-1.0, 1.0);
             }
-
-            // Tail: only one source has data — clamp but no addition.
             let tail: &[f32] = if lb.len() > mic_data.len() {
                 &lb[overlap..]
             } else {
                 &mic_data[overlap..]
             };
             for (j, &s) in tail.iter().enumerate() {
-                let i = overlap + j;
-                let clamped = s.clamp(-1.0, 1.0);
-                write_buf[i * 4..i * 4 + 4].copy_from_slice(&clamped.to_le_bytes());
+                pending[base + overlap + j] = s.clamp(-1.0, 1.0);
+            }
+        }
+
+        // --- pace output to video clock ---
+        // Each video frame corresponds to (sample_rate / fps) stereo
+        // frames = (sample_rate / fps * 2) f32 values.  Only write up
+        // to the amount the video timeline has consumed so far.
+        let vf = video_frames.load(Ordering::Relaxed);
+        let target_samples = vf * target_rate as u64 / video_fps;
+        let target_values = target_samples * 2; // stereo
+        let allowed = target_values.saturating_sub(samples_written) as usize;
+        let to_write = allowed.min(pending.len());
+
+        if to_write > 0 {
+            write_buf.resize(to_write * 4, 0);
+            for (i, &s) in pending[..to_write].iter().enumerate() {
+                write_buf[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
             }
 
-            if pipe_file.write_all(&write_buf[..len * 4]).is_err() {
+            if pipe_file.write_all(&write_buf[..to_write * 4]).is_err() {
                 log("[snapple] audio pipe broken");
                 break;
             }
+            samples_written += to_write as u64 / 2;
+            pending.drain(..to_write);
         }
 
         thread::sleep(Duration::from_millis(5));

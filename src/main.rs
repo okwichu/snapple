@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use global_hotkey::hotkey::{Code, HotKey};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
-use muda::{Menu, MenuItem, PredefinedMenuItem};
+use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::TrayIconBuilder;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -126,12 +126,14 @@ fn run() -> Result<()> {
 
     // Build tray menu
     let status_item = MenuItem::new("Snapple \u{2014} Idle", false, None);
+    let mic_item = CheckMenuItem::new("Record Microphone", true, true, None);
     let separator = PredefinedMenuItem::separator();
     let open_clips = MenuItem::new("Open Clips Folder", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
     let menu = Menu::new();
     menu.append(&status_item)?;
+    menu.append(&mic_item)?;
     menu.append(&separator)?;
     menu.append(&open_clips)?;
     menu.append(&quit_item)?;
@@ -183,10 +185,15 @@ fn run() -> Result<()> {
                         session.stop();
                     }
 
+                    let mut cap_cfg = cfg.capture.clone();
+                    if !mic_item.is_checked() {
+                        cap_cfg.microphone = "none".into();
+                    }
+
                     match capture::CaptureSession::start(
                         seg_dir.clone(),
                         ffmpeg_path.clone(),
-                        cfg.capture.clone(),
+                        cap_cfg,
                         cleanup_age,
                         pid,
                     ) {
