@@ -1,0 +1,42 @@
+[package]
+name = "Snapple"
+version = "0.1.0"
+edition = "2024"
+authors = ["okwic"]
+description = "Lightweight Windows game clip capture utility"
+license = "MIT"
+
+[package.metadata.wix]
+eula = false
+
+[dependencies]
+anyhow = "1.0.102"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+winreg = "0.55"
+chrono = "0.4.44"
+global-hotkey = "0.7.0"
+muda = "0.17.1"
+sysinfo = "0.38.4"
+tray-icon = "0.21.3"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Pipes",
+    "Win32_System_Variant",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+] }
