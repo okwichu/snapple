@@ -9,11 +9,11 @@ mod icon;
 mod sound;
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -53,30 +53,57 @@ fn find_ffmpeg() -> Result<PathBuf> {
 }
 
 fn log_file_path() -> &'static PathBuf {
-    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| config::exe_sibling("snapple.log"))
 }
 
+/// Thread-safe log writer. Opening the file once and protecting it with a
+/// Mutex prevents Windows file-locking races that silently dropped messages
+/// when multiple threads (capture, audio, main) called `log()` concurrently.
+fn log_writer() -> &'static Mutex<Option<File>> {
+    static WRITER: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file_path())
+            .ok();
+        Mutex::new(file)
+    })
+}
+
 fn setup_logging() {
-    let log_path = log_file_path();
-    // Redirect panics to the log file
-    let log_path2 = log_path.clone();
-    std::panic::set_hook(Box::new(move |info| {
+    // Force the log writer to initialise before any threads start.
+    let _ = log_writer();
+
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {info}");
+        // Try the shared writer first; fall back to an independent open
+        // only if the Mutex is poisoned (i.e. the panic happened while
+        // another thread held the lock).
+        if let Ok(mut guard) = log_writer().lock() {
+            if let Some(ref mut f) = *guard {
+                let _ = writeln!(f, "{msg}");
+                let _ = f.flush();
+                return;
+            }
+        }
         let _ = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path2)
-            .and_then(|mut f| writeln!(f, "PANIC: {info}"));
+            .open(log_file_path())
+            .and_then(|mut f| writeln!(f, "{msg}"));
     }));
 }
 
 pub fn log(msg: &str) {
     eprintln!("{msg}");
-    let _ = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file_path())
-        .and_then(|mut f| writeln!(f, "{msg}"));
+    if let Ok(mut guard) = log_writer().lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "{msg}");
+            let _ = f.flush();
+        }
+    }
 }
 
 fn run() -> Result<()> {

@@ -182,6 +182,7 @@ fn capture_thread(
     let mut last_frame = vec![0u8; frame_size];
     let mut has_first_frame = false;
     let mut last_cleanup = Instant::now();
+    let mut prev_content = (width, height);
 
     while running.load(Ordering::Relaxed) {
         let frame_start = Instant::now();
@@ -194,6 +195,22 @@ fn capture_thread(
 
         // Poll for next frame
         if let Ok(frame) = frame_pool.TryGetNextFrame() {
+            let content_size = frame.ContentSize().unwrap_or(size);
+            let cw = (content_size.Width as u32).min(width);
+            let ch = (content_size.Height as u32).min(height);
+
+            // Only clear the buffer when the content size actually changes,
+            // not every frame — avoids ~14 MB memset per frame at 4K.
+            if (cw, ch) != prev_content {
+                if cw < width || ch < height {
+                    last_frame.fill(0);
+                }
+                prev_content = (cw, ch);
+            }
+
+            let copy_row = (cw * 4) as usize;
+            let copy_rows = ch as usize;
+
             if let Ok(surface) = frame.Surface() {
                 if let Ok(dxgi_access) = surface.cast::<IDirect3DDxgiInterfaceAccess>() {
                     if let Ok(texture) = unsafe { dxgi_access.GetInterface::<ID3D11Texture2D>() } {
@@ -211,15 +228,15 @@ fn capture_thread(
                                     pitch * height as usize,
                                 );
 
-                                if pitch == row_bytes {
+                                if copy_row == row_bytes && pitch == row_bytes {
                                     last_frame[..frame_size]
                                         .copy_from_slice(&src[..frame_size]);
                                 } else {
-                                    for y in 0..height as usize {
+                                    for y in 0..copy_rows {
                                         let dst = y * row_bytes;
                                         let s = y * pitch;
-                                        last_frame[dst..dst + row_bytes]
-                                            .copy_from_slice(&src[s..s + row_bytes]);
+                                        last_frame[dst..dst + copy_row]
+                                            .copy_from_slice(&src[s..s + copy_row]);
                                     }
                                 }
 
@@ -364,16 +381,21 @@ fn create_winrt_device(
 // ---------------------------------------------------------------------------
 
 /// Find the main visible window belonging to a process.
+///
+/// Picks the largest non-tool window so that anti-cheat overlays, splash
+/// screens, and notification popups don't cause `CreateForWindow` to fail.
 fn find_window_for_pid(pid: u32) -> Option<windows::Win32::Foundation::HWND> {
     use windows::core::BOOL;
-    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetClientRect, GetWindowLongW, GetWindowThreadProcessId,
+        GWL_EXSTYLE, GWL_STYLE, WS_EX_TOOLWINDOW, WS_VISIBLE,
     };
 
     struct SearchState {
         target_pid: u32,
-        found: HWND,
+        best: HWND,
+        best_area: i64,
     }
 
     unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -381,17 +403,40 @@ fn find_window_for_pid(pid: u32) -> Option<windows::Win32::Foundation::HWND> {
             let state = &mut *(lparam.0 as *mut SearchState);
             let mut window_pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
-            if window_pid == state.target_pid && IsWindowVisible(hwnd).as_bool() {
-                state.found = hwnd;
-                return BOOL(0); // stop enumeration
+            if window_pid != state.target_pid {
+                return BOOL(1);
             }
-            BOOL(1) // continue
+
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            if style & WS_VISIBLE.0 == 0 {
+                return BOOL(1);
+            }
+
+            // Skip tool windows (floating toolbars, overlays, tooltips).
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+                return BOOL(1);
+            }
+
+            // Pick the window with the largest client area — this is the game
+            // rendering surface, not a small splash screen or overlay.
+            let mut rect = RECT::default();
+            if GetClientRect(hwnd, &mut rect).is_ok() {
+                let area = (rect.right - rect.left) as i64 * (rect.bottom - rect.top) as i64;
+                if area > state.best_area {
+                    state.best_area = area;
+                    state.best = hwnd;
+                }
+            }
+
+            BOOL(1) // continue — enumerate all windows
         }
     }
 
     let mut state = SearchState {
         target_pid: pid,
-        found: HWND::default(),
+        best: HWND::default(),
+        best_area: 0,
     };
 
     unsafe {
@@ -401,8 +446,8 @@ fn find_window_for_pid(pid: u32) -> Option<windows::Win32::Foundation::HWND> {
         );
     }
 
-    if !state.found.0.is_null() {
-        Some(state.found)
+    if !state.best.0.is_null() {
+        Some(state.best)
     } else {
         None
     }
