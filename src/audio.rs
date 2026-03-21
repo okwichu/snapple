@@ -27,6 +27,10 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
 // AUDCLNT_BUFFERFLAGS
 const BUFFERFLAGS_SILENT: u32 = 0x0000_0002;
+// Let the shared-mode audio engine choose its low-latency default buffer size.
+const SHARED_BUFFER_DURATION_100NS: i64 = 0;
+// Live capture should prefer freshness over perfect backlog preservation.
+const MAX_PENDING_AUDIO_MS: usize = 100;
 
 /// Wraps a HANDLE so it can be sent to another thread.
 ///
@@ -40,6 +44,10 @@ unsafe impl Send for SendableHandle {}
 pub struct AudioPipe {
     pub pipe_path: String,
     pub sample_rate: u32,
+    /// Set to `true` once WASAPI capture is running and the pipe is
+    /// connected.  The capture thread should wait for this before
+    /// sending video frames so both streams start at the same time.
+    pub ready: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -76,13 +84,21 @@ impl AudioPipe {
 
         let handle = SendableHandle(pipe_handle);
         let mic = mic_device.to_string();
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_clone = ready.clone();
 
         let thread = thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
-                if let Err(e) =
-                    audio_thread(handle, &mic, sample_rate, &running, &video_frames, video_fps)
-                {
+                if let Err(e) = audio_thread(
+                    handle,
+                    &mic,
+                    sample_rate,
+                    &running,
+                    &video_frames,
+                    video_fps,
+                    &ready_clone,
+                ) {
                     log(&format!("[snapple] audio error: {e:#}"));
                 }
             })
@@ -91,6 +107,7 @@ impl AudioPipe {
         Ok(Self {
             pipe_path,
             sample_rate,
+            ready,
             thread: Some(thread),
         })
     }
@@ -156,7 +173,7 @@ fn open_wasapi(data_flow: EDataFlow, stream_flags: u32) -> Result<WasapiSource> 
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             stream_flags,
-            10_000_000, // 1-second buffer in 100 ns units
+            SHARED_BUFFER_DURATION_100NS,
             0,
             fmt,
             None,
@@ -277,6 +294,7 @@ fn audio_thread(
     running: &AtomicBool,
     video_frames: &AtomicU64,
     video_fps: u64,
+    ready: &AtomicBool,
 ) -> Result<()> {
     let pipe = pipe.0;
 
@@ -347,6 +365,7 @@ fn audio_thread(
             m.client.Start()?;
         }
     }
+    ready.store(true, Ordering::Release);
 
     // Pre-allocated reusable buffers — avoids per-tick heap allocation.
     let mut lb_raw = Vec::<f32>::new();
@@ -359,8 +378,9 @@ fn audio_thread(
     // Audio samples waiting to be sent — buffered here so we can
     // throttle output to match the video frame clock.
     let mut pending = Vec::<f32>::new();
-    // Total stereo samples (f32 pairs) written to the pipe so far.
-    let mut samples_written: u64 = 0;
+    // Total interleaved f32 values written to the pipe so far.
+    let mut values_written: u64 = 0;
+    let max_pending_values = target_rate as usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
 
     while running.load(Ordering::Relaxed) {
         // --- loopback ---
@@ -411,6 +431,14 @@ fn audio_thread(
             }
         }
 
+        if pending.len() > max_pending_values {
+            let stale = pending.len() - max_pending_values;
+            let drop_values = stale & !1; // keep stereo frame alignment
+            if drop_values > 0 {
+                pending.drain(..drop_values);
+            }
+        }
+
         // --- pace output to video clock ---
         // Each video frame corresponds to (sample_rate / fps) stereo
         // frames = (sample_rate / fps * 2) f32 values.  Only write up
@@ -418,7 +446,7 @@ fn audio_thread(
         let vf = video_frames.load(Ordering::Relaxed);
         let target_samples = vf * target_rate as u64 / video_fps;
         let target_values = target_samples * 2; // stereo
-        let allowed = target_values.saturating_sub(samples_written) as usize;
+        let allowed = target_values.saturating_sub(values_written) as usize;
         let to_write = allowed.min(pending.len());
 
         if to_write > 0 {
@@ -431,7 +459,7 @@ fn audio_thread(
                 log("[snapple] audio pipe broken");
                 break;
             }
-            samples_written += to_write as u64 / 2;
+            values_written += to_write as u64;
             pending.drain(..to_write);
         }
 
@@ -446,4 +474,28 @@ fn audio_thread(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_PENDING_AUDIO_MS;
+
+    fn allowed_values(video_frames: u64, sample_rate: u32, fps: u64, values_written: u64) -> u64 {
+        let target_samples = video_frames * sample_rate as u64 / fps;
+        let target_values = target_samples * 2;
+        target_values.saturating_sub(values_written)
+    }
+
+    #[test]
+    fn pacing_tracks_interleaved_values_consistently() {
+        assert_eq!(allowed_values(1, 48_000, 60, 0), 1_600);
+        assert_eq!(allowed_values(1, 48_000, 60, 1_600), 0);
+        assert_eq!(allowed_values(2, 48_000, 60, 1_600), 1_600);
+    }
+
+    #[test]
+    fn backlog_cap_is_small_enough_for_live_capture() {
+        let max_pending_values = 48_000usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
+        assert_eq!(max_pending_values, 9_600);
+    }
 }

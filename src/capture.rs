@@ -165,6 +165,19 @@ fn capture_thread(
     drain_ffmpeg_stderr(&mut ffmpeg);
     let mut stdin = ffmpeg.stdin.take().context("No ffmpeg stdin")?;
 
+    // Wait for audio to be connected and streaming before sending video
+    // frames, so both streams start at the same real time.  Without this
+    // the video runs ~2 s ahead while audio initialises.
+    if let Some(ref ap) = audio_pipe {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ap.ready.load(Ordering::Acquire) {
+            if !running.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     let frame_interval = Duration::from_micros(1_000_000 / capture_cfg.fps);
     let row_bytes = (width * 4) as usize;
     let frame_size = row_bytes * height as usize;
@@ -631,6 +644,10 @@ fn build_ffmpeg_args(
     let mut args: Vec<String> = vec!["-y".into()];
 
     args.extend([
+        "-fflags".into(),
+        "nobuffer".into(),
+        "-flags".into(),
+        "low_delay".into(),
         "-f".into(),
         "rawvideo".into(),
         "-pix_fmt".into(),
@@ -645,6 +662,8 @@ fn build_ffmpeg_args(
 
     if let Some(ref ai) = audio {
         args.extend([
+            "-fflags".into(),
+            "nobuffer".into(),
             "-f".into(),
             "f32le".into(),
             "-ar".into(),
@@ -670,10 +689,23 @@ fn build_ffmpeg_args(
     ]);
 
     if audio.is_some() {
-        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "128k".into()]);
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "128k".into(),
+            "-af".into(),
+            "aresample=async=1:min_hard_comp=0.100:first_pts=0".into(),
+        ]);
     }
 
     args.extend([
+        "-muxpreload".into(),
+        "0".into(),
+        "-muxdelay".into(),
+        "0".into(),
+        "-max_interleave_delta".into(),
+        "0".into(),
         "-f".into(),
         "segment".into(),
         "-segment_time".into(),
@@ -784,6 +816,28 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-ac", "2"]));
         assert!(args.windows(2).any(|w| w == ["-i", r"\\.\pipe\snapple_audio_42"]));
         assert!(args.windows(2).any(|w| w == ["-c:a", "aac"]));
+        assert!(args.windows(2).any(|w| w == ["-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0"]));
+    }
+
+    #[test]
+    fn ffmpeg_args_request_low_latency_input_and_muxing() {
+        let cfg = CaptureConfig::default();
+        let args = build_ffmpeg_args(
+            1920,
+            1080,
+            Path::new("C:/temp"),
+            &cfg,
+            Some(AudioInput {
+                pipe_path: r"\\.\pipe\snapple_audio_42",
+                sample_rate: 48_000,
+            }),
+        );
+
+        assert!(args.windows(2).any(|w| w == ["-fflags", "nobuffer"]));
+        assert!(args.windows(2).any(|w| w == ["-flags", "low_delay"]));
+        assert!(args.windows(2).any(|w| w == ["-muxpreload", "0"]));
+        assert!(args.windows(2).any(|w| w == ["-muxdelay", "0"]));
+        assert!(args.windows(2).any(|w| w == ["-max_interleave_delta", "0"]));
     }
 
     #[test]
