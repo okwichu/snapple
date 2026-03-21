@@ -55,9 +55,7 @@ pub struct SteamConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            clips_dir: dirs::video_dir()
-                .unwrap_or_else(|| PathBuf::from("Videos"))
-                .join("Snapple"),
+            clips_dir: PathBuf::from(r"D:\Clips"),
             hotkey: "F8".into(),
             capture: CaptureConfig::default(),
             buffer: BufferConfig::default(),
