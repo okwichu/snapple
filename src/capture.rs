@@ -889,9 +889,7 @@ fn build_ffmpeg_args(
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
-            "128k".into(),
-            "-af".into(),
-            "aresample=async=1:min_hard_comp=0.100:first_pts=0".into(),
+            "192k".into(),
         ]);
     }
 
@@ -1009,7 +1007,57 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-ac", "2"]));
         assert!(args.windows(2).any(|w| w == ["-i", r"\\.\pipe\snapple_audio_42"]));
         assert!(args.windows(2).any(|w| w == ["-c:a", "aac"]));
-        assert!(args.windows(2).any(|w| w == ["-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0"]));
+        assert!(args.windows(2).any(|w| w == ["-b:a", "192k"]));
+    }
+
+    #[test]
+    fn ffmpeg_args_no_aresample_filter() {
+        let cfg = CaptureConfig::default();
+        let args = build_ffmpeg_args(
+            1920,
+            1080,
+            Path::new("C:/temp"),
+            &cfg,
+            Some(AudioInput {
+                pipe_path: r"\\.\pipe\snapple_audio_42",
+                sample_rate: 48_000,
+            }),
+        );
+
+        // aresample=async was removed — raw pipe input doesn't need it,
+        // and it caused artifacts under backpressure.
+        assert!(
+            !args.iter().any(|a| a.contains("aresample")),
+            "aresample filter must not be present — it causes audio artifacts"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-af"),
+            "no audio filters should be applied"
+        );
+    }
+
+    #[test]
+    fn audio_bitrate_is_192k() {
+        let cfg = CaptureConfig::default();
+        let args = build_ffmpeg_args(
+            1920,
+            1080,
+            Path::new("C:/temp"),
+            &cfg,
+            Some(AudioInput {
+                pipe_path: r"\\.\pipe\snapple_audio_42",
+                sample_rate: 48_000,
+            }),
+        );
+
+        assert!(
+            args.windows(2).any(|w| w == ["-b:a", "192k"]),
+            "audio bitrate must be 192k, got args: {args:?}"
+        );
+        assert!(
+            !args.windows(2).any(|w| w == ["-b:a", "128k"]),
+            "128k bitrate must not be used"
+        );
     }
 
     #[test]

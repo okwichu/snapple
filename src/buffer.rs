@@ -83,7 +83,8 @@ pub fn save_clip(
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let output = clips_dir.join(format!("{safe_name}_{timestamp}.mp4"));
 
-    // Remux (copy, no re-encode — fast)
+    // Re-encode audio to eliminate AAC priming artifacts at segment
+    // boundaries; video is still stream-copied (fast).
     let status = Command::new(ffmpeg_path)
         .args([
             "-y",
@@ -93,8 +94,12 @@ pub fn save_clip(
             "0",
             "-i",
             &concat_file.to_string_lossy(),
-            "-c",
+            "-c:v",
             "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
             &output.to_string_lossy(),
         ])
         .creation_flags(CREATE_NO_WINDOW)

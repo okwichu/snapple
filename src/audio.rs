@@ -30,9 +30,10 @@ const BUFFERFLAGS_SILENT: u32 = 0x0000_0002;
 // 1-second WASAPI buffer (in 100 ns units) — large enough that brief pipe
 // stalls or encoding back-pressure won't cause WASAPI to drop audio.
 const SHARED_BUFFER_DURATION_100NS: i64 = 10_000_000;
-// Safety cap on the pending buffer.  2 seconds is generous enough to absorb
-// startup transients and encoding spikes without discarding usable audio.
-const MAX_PENDING_AUDIO_MS: usize = 2000;
+// Safety cap on the pending buffer.  150 ms is tight enough to prevent
+// audible audio delay when encoding backpressure stalls the video thread,
+// while still absorbing normal scheduling jitter.
+const MAX_PENDING_AUDIO_MS: usize = 150;
 
 /// Wraps a HANDLE so it can be sent to another thread.
 ///
@@ -480,13 +481,43 @@ fn audio_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_PENDING_AUDIO_MS;
+    use super::{resample_stereo_into, to_stereo_into, MAX_PENDING_AUDIO_MS};
 
     fn allowed_values(video_frames: u64, sample_rate: u32, fps: u64, values_written: u64) -> u64 {
         let target_samples = video_frames * sample_rate as u64 / fps;
         let target_values = target_samples * 2;
         target_values.saturating_sub(values_written)
     }
+
+    /// Simulate the pending-buffer drain logic from the audio thread.
+    /// Returns (values_written, pending_len) after processing.
+    fn simulate_drain(
+        pending: &mut Vec<f32>,
+        video_frames: u64,
+        sample_rate: u32,
+        fps: u64,
+        values_written: &mut u64,
+    ) -> usize {
+        let max_pending_values = sample_rate as usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
+        if pending.len() > max_pending_values {
+            let stale = pending.len() - max_pending_values;
+            let drop_values = stale & !1;
+            if drop_values > 0 {
+                pending.drain(..drop_values);
+            }
+        }
+        let target_samples = video_frames * sample_rate as u64 / fps;
+        let target_values = target_samples * 2;
+        let allowed = target_values.saturating_sub(*values_written) as usize;
+        let to_write = allowed.min(pending.len());
+        *values_written += to_write as u64;
+        pending.drain(..to_write);
+        to_write
+    }
+
+    // -----------------------------------------------------------------------
+    // Pacing arithmetic
+    // -----------------------------------------------------------------------
 
     #[test]
     fn pacing_tracks_interleaved_values_consistently() {
@@ -496,8 +527,181 @@ mod tests {
     }
 
     #[test]
-    fn backlog_cap_allows_generous_buffer() {
+    fn pacing_exact_ratio_at_common_rates() {
+        // 48 kHz / 60 fps = exactly 800 samples per frame, no rounding error.
+        for vf in 0..120 {
+            let expected = vf * 800 * 2;
+            assert_eq!(allowed_values(vf, 48_000, 60, 0), expected);
+        }
+        // 44.1 kHz / 30 fps = 1470 samples per frame (exact).
+        assert_eq!(allowed_values(1, 44_100, 30, 0), 2_940);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending-buffer cap — the core audio-delay prevention
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_cap_prevents_audible_delay() {
+        // The cap MUST stay ≤ 200 ms to keep audio delay imperceptible.
+        assert!(
+            MAX_PENDING_AUDIO_MS <= 200,
+            "MAX_PENDING_AUDIO_MS is {MAX_PENDING_AUDIO_MS} — must be ≤ 200 to prevent audible delay"
+        );
+    }
+
+    #[test]
+    fn pending_cap_value_at_48khz_stereo() {
         let max_pending_values = 48_000usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
-        assert_eq!(max_pending_values, 192_000); // 2 seconds at 48 kHz stereo
+        // 150 ms at 48 kHz stereo = 14,400 interleaved f32 values.
+        assert_eq!(max_pending_values, 14_400);
+    }
+
+    #[test]
+    fn pending_drain_discards_oldest_when_over_cap() {
+        // Simulate 500 ms of audio sitting in pending (well over the 150 ms cap).
+        let sample_rate: u32 = 48_000;
+        let half_sec_values = sample_rate as usize * 2 * 500 / 1000; // 48,000 values
+        let mut pending: Vec<f32> = (0..half_sec_values).map(|i| i as f32).collect();
+        let mut written: u64 = 0;
+
+        // Allow 1 frame of video (800 samples = 1,600 values).
+        simulate_drain(&mut pending, 1, sample_rate, 60, &mut written);
+
+        let cap_values = sample_rate as usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
+        // Pending should be at most the cap minus what was just written.
+        assert!(
+            pending.len() <= cap_values,
+            "pending {} exceeds cap {cap_values}",
+            pending.len()
+        );
+        // The OLDEST samples (low values) should have been discarded.
+        if !pending.is_empty() {
+            assert!(
+                pending[0] > 0.0,
+                "oldest sample should have been drained, got {}",
+                pending[0]
+            );
+        }
+    }
+
+    #[test]
+    fn steady_state_60fps_no_drift() {
+        // Simulate 10 seconds of perfectly steady 60 fps capture.
+        // Pending should never grow beyond a few ms of audio.
+        let sample_rate: u32 = 48_000;
+        let fps: u64 = 60;
+        let values_per_tick = (sample_rate as usize * 2 * 5) / 1000; // 5 ms of audio per tick
+        let mut pending = Vec::<f32>::new();
+        let mut written: u64 = 0;
+        let mut vf: u64 = 0;
+        let mut max_pending = 0usize;
+
+        // 2000 ticks × 5 ms = 10 seconds
+        for tick in 0..2_000u64 {
+            // Audio arrives every tick.
+            pending.extend(std::iter::repeat_n(0.0f32, values_per_tick));
+
+            // Video frame every ~3.33 ticks (60 fps ÷ 200 Hz tick).
+            // Advance video_frames to match wall-clock time.
+            let expected_vf = (tick + 1) * fps / 200;
+            vf = vf.max(expected_vf);
+
+            simulate_drain(&mut pending, vf, sample_rate, fps, &mut written);
+            max_pending = max_pending.max(pending.len());
+        }
+
+        // In steady state, pending should be tiny (well under 50 ms).
+        let max_pending_ms = max_pending * 1000 / (sample_rate as usize * 2);
+        assert!(
+            max_pending_ms < 50,
+            "pending peaked at {max_pending_ms} ms in steady state — expected < 50 ms"
+        );
+    }
+
+    #[test]
+    fn video_stall_delay_bounded_by_cap() {
+        // Simulate a 1-second video stall: audio keeps arriving but
+        // video_frames freezes.  Pending must stay ≤ cap.
+        let sample_rate: u32 = 48_000;
+        let fps: u64 = 60;
+        let values_per_tick = (sample_rate as usize * 2 * 5) / 1000;
+        let mut pending = Vec::<f32>::new();
+        let mut written: u64 = 0;
+        let cap_values = sample_rate as usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
+
+        // 1 second of normal operation.
+        let mut vf: u64 = 0;
+        for tick in 0..200u64 {
+            pending.extend(std::iter::repeat_n(0.0f32, values_per_tick));
+            vf = (tick + 1) * fps / 200;
+            simulate_drain(&mut pending, vf, sample_rate, fps, &mut written);
+        }
+
+        // 1-second stall: audio arrives but video_frames frozen.
+        let frozen_vf = vf;
+        for _ in 0..200u64 {
+            pending.extend(std::iter::repeat_n(0.0f32, values_per_tick));
+            simulate_drain(&mut pending, frozen_vf, sample_rate, fps, &mut written);
+        }
+
+        assert!(
+            pending.len() <= cap_values,
+            "pending {} exceeds cap {cap_values} during video stall",
+            pending.len()
+        );
+
+        // After stall, the maximum delay in the buffer is bounded.
+        let delay_ms = pending.len() * 1000 / (sample_rate as usize * 2);
+        assert!(
+            delay_ms <= MAX_PENDING_AUDIO_MS,
+            "delay {delay_ms} ms exceeds MAX_PENDING_AUDIO_MS {MAX_PENDING_AUDIO_MS}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Format conversion helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mono_to_stereo_duplicates_channels() {
+        let mono = vec![1.0f32, 2.0, 3.0];
+        let mut out = Vec::new();
+        to_stereo_into(&mono, 1, &mut out);
+        assert_eq!(out, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn multichannel_to_stereo_keeps_first_two() {
+        // 4-channel: [L R C LFE] per frame
+        let quad = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut out = Vec::new();
+        to_stereo_into(&quad, 4, &mut out);
+        assert_eq!(out, vec![1.0, 2.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn resample_identity_when_rates_close() {
+        // Resample 48000→48000 should be near-identity (caller should skip,
+        // but verify the function doesn't corrupt data if called anyway).
+        let input: Vec<f32> = (0..200).map(|i| (i as f32) / 200.0).collect();
+        let mut out = Vec::new();
+        resample_stereo_into(&input, 48_000, 48_000, &mut out);
+        assert_eq!(out.len(), input.len());
+        for (a, b) in out.iter().zip(input.iter()) {
+            assert!((a - b).abs() < 1e-5, "sample mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn resample_preserves_stereo_frame_count() {
+        // 44100→48000: output should have more frames.
+        let in_frames = 441; // 10 ms at 44.1 kHz
+        let input: Vec<f32> = vec![0.5; in_frames * 2];
+        let mut out = Vec::new();
+        resample_stereo_into(&input, 44_100, 48_000, &mut out);
+        let out_frames = out.len() / 2;
+        let expected = (in_frames as u64 * 48_000 / 44_100) as usize; // 480
+        assert_eq!(out_frames, expected);
     }
 }
