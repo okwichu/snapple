@@ -97,10 +97,11 @@ fn setup_logging() {
 }
 
 pub fn log(msg: &str) {
-    eprintln!("{msg}");
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    eprintln!("{ts} {msg}");
     if let Ok(mut guard) = log_writer().lock() {
         if let Some(ref mut f) = *guard {
-            let _ = writeln!(f, "{msg}");
+            let _ = writeln!(f, "{ts} {msg}");
             let _ = f.flush();
         }
     }

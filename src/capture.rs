@@ -131,58 +131,7 @@ fn capture_thread(
     // Start capture
     session.StartCapture()?;
 
-    // Shared counter: the capture loop increments this after each frame
-    // write so the audio thread can pace its output to match the video
-    // clock, preventing A/V desync when encoding back-pressure slows
-    // the video pipe below the declared fps.
-    let video_frames = Arc::new(AtomicU64::new(0));
-
-    // Start audio capture (best-effort — video continues even if audio fails)
-    let audio_pipe = match audio::AudioPipe::start(
-        &capture_cfg.microphone,
-        running.clone(),
-        video_frames.clone(),
-        capture_cfg.fps,
-    ) {
-        Ok(ap) => {
-            log(&format!(
-                "[snapple] audio capture started ({}Hz stereo)",
-                ap.sample_rate
-            ));
-            Some(ap)
-        }
-        Err(e) => {
-            log(&format!("[snapple] audio unavailable: {e:#}"));
-            None
-        }
-    };
-
-    // Spawn ffmpeg
-    let audio_input = audio_pipe
-        .as_ref()
-        .map(|ap| AudioInput { pipe_path: &ap.pipe_path, sample_rate: ap.sample_rate });
-    let mut ffmpeg = spawn_ffmpeg(ffmpeg_path, width, height, seg_dir, capture_cfg, audio_input)?;
-    drain_ffmpeg_stderr(&mut ffmpeg);
-    let mut stdin = ffmpeg.stdin.take().context("No ffmpeg stdin")?;
-
-    // Wait for audio to be connected and streaming before sending video
-    // frames, so both streams start at the same real time.  Without this
-    // the video runs ~2 s ahead while audio initialises.
-    if let Some(ref ap) = audio_pipe {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ap.ready.load(Ordering::Acquire) {
-            if !running.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    let frame_interval = Duration::from_micros(1_000_000 / capture_cfg.fps);
-    let row_bytes = (width * 4) as usize;
-    let frame_size = row_bytes * height as usize;
-
-    // Staging texture for CPU readback
+    // Staging texture for GPU→CPU readback (full capture size for CopyResource).
     let staging_desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
@@ -202,105 +151,225 @@ fn capture_thread(
     unsafe { d3d_device.CreateTexture2D(&staging_desc, None, Some(&mut staging_opt))? };
     let staging = staging_opt.context("Failed to create staging texture")?;
 
-    // Frame buffer — we always send a frame every tick to maintain the declared FPS.
-    // Without this, missed polls cause the video to play faster than real-time.
-    let mut last_frame = vec![0u8; frame_size];
-    let mut has_first_frame = false;
-    let mut last_cleanup = Instant::now();
-    let mut prev_content = (width, height);
+    // Resolve encoder once — probe ffmpeg for a working H.264 encoder if the
+    // configured one isn't available (e.g. nvenc on an AMD-only laptop).
+    let resolved_cfg = resolve_encoder(ffmpeg_path, capture_cfg);
+    let fps = resolved_cfg.fps;
 
-    while running.load(Ordering::Relaxed) {
-        let frame_start = Instant::now();
+    // -----------------------------------------------------------------------
+    // Session loop — restarts ffmpeg when the content size changes (e.g. the
+    // game transitions from a splash screen to fullscreen).  The capture item
+    // and frame pool stay alive across restarts; only the encoding pipeline
+    // (audio pipe + ffmpeg + frame buffer) is recycled.
+    // -----------------------------------------------------------------------
+    let mut content_w = width;
+    let mut content_h = height;
 
-        // Periodic segment cleanup
-        if last_cleanup.elapsed() > Duration::from_secs(10) {
-            let _ = buffer::cleanup_old_segments(seg_dir, cleanup_age_secs);
-            last_cleanup = Instant::now();
+    'session: loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
         }
 
-        // Poll for next frame
-        if let Ok(frame) = frame_pool.TryGetNextFrame() {
-            let content_size = frame.ContentSize().unwrap_or(size);
-            let cw = (content_size.Width as u32).min(width);
-            let ch = (content_size.Height as u32).min(height);
-
-            // Only clear the buffer when the content size actually changes,
-            // not every frame — avoids ~14 MB memset per frame at 4K.
-            if (cw, ch) != prev_content {
-                if cw < width || ch < height {
-                    last_frame.fill(0);
+        // --- Detect content size from recent frames -------------------------
+        {
+            let mut best_w = 0u32;
+            let mut best_h = 0u32;
+            let mut best_area: u64 = 0;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline && running.load(Ordering::Relaxed) {
+                if let Ok(frame) = frame_pool.TryGetNextFrame() {
+                    let cs = frame.ContentSize().unwrap_or(size);
+                    let fw = (cs.Width as u32).min(width);
+                    let fh = (cs.Height as u32).min(height);
+                    let area = fw as u64 * fh as u64;
+                    if area > best_area {
+                        best_area = area;
+                        best_w = fw;
+                        best_h = fh;
+                    }
+                    let _ = frame.Close();
                 }
-                prev_content = (cw, ch);
+                thread::sleep(Duration::from_millis(10));
+            }
+            if best_area > 0 {
+                content_w = best_w;
+                content_h = best_h;
+            }
+            // else: keep previous content size (or full surface on first pass)
+        }
+
+        if content_w != width || content_h != height {
+            log(&format!(
+                "[snapple] content {content_w}x{content_h} inside {width}x{height} capture surface"
+            ));
+        } else {
+            log(&format!(
+                "[snapple] content matches capture surface ({width}x{height})"
+            ));
+        }
+
+        // --- Start encoding pipeline ---------------------------------------
+        let video_frames = Arc::new(AtomicU64::new(0));
+
+        let audio_pipe = match audio::AudioPipe::start(
+            &resolved_cfg.microphone,
+            running.clone(),
+            video_frames.clone(),
+            fps,
+        ) {
+            Ok(ap) => {
+                log(&format!(
+                    "[snapple] audio capture started ({}Hz stereo)",
+                    ap.sample_rate
+                ));
+                Some(ap)
+            }
+            Err(e) => {
+                log(&format!("[snapple] audio unavailable: {e:#}"));
+                None
+            }
+        };
+
+        // Compute output dims early so we can pass them to ffmpeg.
+        let (out_w, out_h) = compute_output_dims(&resolved_cfg.scale, content_w, content_h);
+
+        let audio_input = audio_pipe
+            .as_ref()
+            .map(|ap| AudioInput { pipe_path: &ap.pipe_path, sample_rate: ap.sample_rate });
+        let mut ffmpeg = match spawn_ffmpeg(ffmpeg_path, out_w, out_h, seg_dir, &resolved_cfg, audio_input) {
+            Ok(f) => f,
+            Err(e) => {
+                log(&format!("[snapple] failed to spawn ffmpeg: {e:#}"));
+                drop(audio_pipe);
+                break;
+            }
+        };
+        drain_ffmpeg_stderr(&mut ffmpeg);
+        let mut stdin = match ffmpeg.stdin.take() {
+            Some(s) => s,
+            None => {
+                log("[snapple] no ffmpeg stdin");
+                drop(audio_pipe);
+                break;
+            }
+        };
+
+        if let Some(ref ap) = audio_pipe {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ap.ready.load(Ordering::Acquire) {
+                if !running.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        let out_row_bytes = (out_w * 4) as usize;
+        let out_frame_size = out_row_bytes * out_h as usize;
+        log(&format!(
+            "[snapple] output {out_w}x{out_h} (pre-scaled from {content_w}x{content_h})"
+        ));
+
+        let mut last_frame = vec![0u8; out_frame_size];
+        let mut has_first_frame = false;
+        let mut last_cleanup = Instant::now();
+        let mut frame_count: u64 = 0;
+        let mut pacing_origin: Option<Instant> = None;
+
+        // --- Frame loop -----------------------------------------------------
+        let mut needs_restart = false;
+
+        while running.load(Ordering::Relaxed) {
+            if last_cleanup.elapsed() > Duration::from_secs(10) {
+                let _ = buffer::cleanup_old_segments(seg_dir, cleanup_age_secs);
+                last_cleanup = Instant::now();
             }
 
-            let copy_row = (cw * 4) as usize;
-            let copy_rows = ch as usize;
+            if let Ok(frame) = frame_pool.TryGetNextFrame() {
+                let content_size = frame.ContentSize().unwrap_or(size);
+                let raw_cw = (content_size.Width as u32).min(width);
+                let raw_ch = (content_size.Height as u32).min(height);
 
-            if let Ok(surface) = frame.Surface() {
-                if let Ok(dxgi_access) = surface.cast::<IDirect3DDxgiInterfaceAccess>() {
-                    if let Ok(texture) = unsafe { dxgi_access.GetInterface::<ID3D11Texture2D>() } {
-                        unsafe {
-                            d3d_context.CopyResource(&staging, &texture);
+                // If the content grew beyond our current dimensions, restart
+                // the pipeline so ffmpeg gets the right resolution.
+                if raw_cw > content_w || raw_ch > content_h {
+                    log(&format!(
+                        "[snapple] content size grew to {raw_cw}x{raw_ch} (was {content_w}x{content_h}), restarting pipeline"
+                    ));
+                    let _ = frame.Close();
+                    needs_restart = true;
+                    break;
+                }
 
-                            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                            if d3d_context
-                                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                                .is_ok()
-                            {
-                                let pitch = mapped.RowPitch as usize;
-                                let src = std::slice::from_raw_parts(
-                                    mapped.pData as *const u8,
-                                    pitch * height as usize,
-                                );
+                let src_w = raw_cw.min(content_w) as usize;
+                let src_h = raw_ch.min(content_h) as usize;
 
-                                if copy_row == row_bytes && pitch == row_bytes {
-                                    last_frame[..frame_size]
-                                        .copy_from_slice(&src[..frame_size]);
-                                } else {
-                                    for y in 0..copy_rows {
-                                        let dst = y * row_bytes;
-                                        let s = y * pitch;
-                                        last_frame[dst..dst + copy_row]
-                                            .copy_from_slice(&src[s..s + copy_row]);
-                                    }
+                if let Ok(surface) = frame.Surface() {
+                    if let Ok(dxgi_access) = surface.cast::<IDirect3DDxgiInterfaceAccess>() {
+                        if let Ok(texture) = unsafe { dxgi_access.GetInterface::<ID3D11Texture2D>() } {
+                            unsafe {
+                                d3d_context.CopyResource(&staging, &texture);
+
+                                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                                if d3d_context
+                                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                                    .is_ok()
+                                {
+                                    let pitch = mapped.RowPitch as usize;
+
+                                    // Downsample directly from the mapped GPU
+                                    // texture into the output-sized frame buffer.
+                                    let src_ptr = mapped.pData as *const u8;
+                                    downsample_bgra(
+                                        src_ptr, src_w, src_h, pitch,
+                                        &mut last_frame, out_w as usize, out_h as usize,
+                                    );
+
+                                    d3d_context.Unmap(&staging, 0);
+                                    has_first_frame = true;
                                 }
-
-                                d3d_context.Unmap(&staging, 0);
-                                has_first_frame = true;
                             }
                         }
                     }
                 }
+                let _ = frame.Close();
             }
-            let _ = frame.Close();
+
+            if has_first_frame {
+                let origin = *pacing_origin.get_or_insert_with(Instant::now);
+
+                if stdin.write_all(&last_frame).is_err() {
+                    log("[snapple] ffmpeg pipe broken, stopping capture");
+                    break;
+                }
+                video_frames.fetch_add(1, Ordering::Relaxed);
+                frame_count += 1;
+
+                let next_due_us = frame_count * 1_000_000 / fps;
+                let next_due = origin + Duration::from_micros(next_due_us);
+                let now = Instant::now();
+                if next_due > now {
+                    thread::sleep(next_due - now);
+                }
+            } else {
+                thread::sleep(Duration::from_micros(1_000_000 / fps));
+            }
         }
 
-        // Always send a frame at the declared rate to keep video in real-time.
-        if has_first_frame {
-            if stdin.write_all(&last_frame).is_err() {
-                log("[snapple] ffmpeg pipe broken, stopping capture");
-                break;
-            }
-            video_frames.fetch_add(1, Ordering::Relaxed);
-        }
+        // --- Tear down encoding pipeline ------------------------------------
+        drop(stdin);
+        let _ = ffmpeg.wait();
+        drop(audio_pipe);
 
-        // Frame pacing
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_interval {
-            thread::sleep(frame_interval - elapsed);
+        if !needs_restart {
+            break 'session;
         }
+        // Loop back to re-detect content size and restart pipeline.
     }
 
     // Stop capture
     let _ = session.Close();
     let _ = frame_pool.Close();
-
-    // Finalize ffmpeg
-    drop(stdin);
-    let _ = ffmpeg.wait();
-
-    // Stop audio (AudioPipe::drop joins the audio thread)
-    drop(audio_pipe);
 
     // Restore default timer resolution.
     unsafe { timeEndPeriod(1); }
@@ -600,6 +669,137 @@ fn create_monitor_capture_item(
 }
 
 // ---------------------------------------------------------------------------
+// Pre-scaling helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a scale filter string like "scale=-2:720" and compute the output
+/// dimensions, preserving aspect ratio and rounding to the nearest even number.
+fn compute_output_dims(scale: &str, src_w: u32, src_h: u32) -> (u32, u32) {
+    if let Some(rest) = scale.strip_prefix("scale=") {
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() == 2 {
+            let w: Option<i32> = parts[0].parse().ok();
+            let h: Option<i32> = parts[1].parse().ok();
+            match (w, h) {
+                (Some(-2 | -1), Some(th)) if th > 0 => {
+                    let th = th as u32;
+                    let raw = (src_w as u64 * th as u64 / src_h as u64) as u32;
+                    return ((raw + 1) & !1, th);
+                }
+                (Some(tw), Some(-2 | -1)) if tw > 0 => {
+                    let tw = tw as u32;
+                    let raw = (src_h as u64 * tw as u64 / src_w as u64) as u32;
+                    return (tw, (raw + 1) & !1);
+                }
+                _ => {}
+            }
+        }
+    }
+    (src_w, src_h)
+}
+
+/// Nearest-neighbour downsample of a BGRA image.  Reads directly from a
+/// mapped GPU staging texture (with arbitrary row pitch) and writes into a
+/// tightly-packed output buffer.
+///
+/// # Safety
+/// `src` must point to at least `src_pitch * src_h` readable bytes.
+unsafe fn downsample_bgra(
+    src: *const u8,
+    src_w: usize,
+    src_h: usize,
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+) {
+    unsafe {
+        for dy in 0..dst_h {
+            let sy = dy * src_h / dst_h;
+            let src_row = src.add(sy * src_pitch);
+            let dst_off = dy * dst_w * 4;
+            for dx in 0..dst_w {
+                let sx = dx * src_w / dst_w;
+                let si = sx * 4;
+                let di = dst_off + dx * 4;
+                std::ptr::copy_nonoverlapping(src_row.add(si), dst[di..].as_mut_ptr(), 4);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoder probing & fallback
+// ---------------------------------------------------------------------------
+
+/// Encoder presets: (encoder, preset, rate_control, quality_flag, quality).
+const ENCODER_FALLBACKS: &[(&str, &str, &str, &str)] = &[
+    // NVIDIA
+    ("h264_nvenc", "p4", "constqp", "28"),
+    // AMD
+    ("h264_amf", "speed", "cqp", "28"),
+    // Software (always available) — ultrafast keeps up with 60 fps at 720p.
+    ("libx264", "ultrafast", "crf", "28"),
+];
+
+/// Check if a given encoder is available in ffmpeg by doing a tiny test encode.
+fn probe_encoder(ffmpeg_path: &Path, encoder: &str) -> bool {
+    // Encode 1 frame of 16x16 black to /dev/null.
+    let status = Command::new(ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "lavfi",
+            "-i", "color=black:s=16x16:d=0.01",
+            "-frames:v", "1",
+            "-c:v", encoder,
+            "-f", "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    matches!(status, Ok(s) if s.success())
+}
+
+/// Return a CaptureConfig with a working encoder. If the configured encoder
+/// works, returns a clone unchanged.  Otherwise walks the fallback list.
+fn resolve_encoder(ffmpeg_path: &Path, cfg: &CaptureConfig) -> CaptureConfig {
+    // Fast path: configured encoder works.
+    if probe_encoder(ffmpeg_path, &cfg.encoder) {
+        log(&format!("[snapple] encoder {} available", cfg.encoder));
+        return cfg.clone();
+    }
+
+    log(&format!(
+        "[snapple] encoder {} unavailable, probing fallbacks…",
+        cfg.encoder
+    ));
+
+    for &(enc, preset, rc, quality) in ENCODER_FALLBACKS {
+        if enc == cfg.encoder {
+            continue; // Already tried.
+        }
+        if probe_encoder(ffmpeg_path, enc) {
+            log(&format!("[snapple] using fallback encoder {enc}"));
+            let mut resolved = cfg.clone();
+            resolved.encoder = enc.into();
+            resolved.preset = preset.into();
+            resolved.rate_control = rc.into();
+            resolved.quality = quality.into();
+            return resolved;
+        }
+    }
+
+    // Nothing worked — return original config and let ffmpeg fail with a
+    // clear error rather than silently skipping capture.
+    log("[snapple] WARNING: no working H.264 encoder found");
+    cfg.clone()
+}
+
+// ---------------------------------------------------------------------------
 // ffmpeg spawning
 // ---------------------------------------------------------------------------
 
@@ -644,10 +844,6 @@ fn build_ffmpeg_args(
     let mut args: Vec<String> = vec!["-y".into()];
 
     args.extend([
-        "-fflags".into(),
-        "nobuffer".into(),
-        "-flags".into(),
-        "low_delay".into(),
         "-f".into(),
         "rawvideo".into(),
         "-pix_fmt".into(),
@@ -662,8 +858,6 @@ fn build_ffmpeg_args(
 
     if let Some(ref ai) = audio {
         args.extend([
-            "-fflags".into(),
-            "nobuffer".into(),
             "-f".into(),
             "f32le".into(),
             "-ar".into(),
@@ -678,6 +872,8 @@ fn build_ffmpeg_args(
     args.extend([
         "-vf".into(),
         cfg.scale.clone(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
         "-c:v".into(),
         cfg.encoder.clone(),
         "-preset".into(),
@@ -700,12 +896,6 @@ fn build_ffmpeg_args(
     }
 
     args.extend([
-        "-muxpreload".into(),
-        "0".into(),
-        "-muxdelay".into(),
-        "0".into(),
-        "-max_interleave_delta".into(),
-        "0".into(),
         "-f".into(),
         "segment".into(),
         "-segment_time".into(),
@@ -766,7 +956,10 @@ fn drain_ffmpeg_stderr(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ffmpeg_args, choose_monitor_target, frame_interval, AudioInput};
+    use super::{
+        build_ffmpeg_args, choose_monitor_target, compute_output_dims, downsample_bgra,
+        frame_interval, AudioInput,
+    };
     use crate::config::CaptureConfig;
     use std::path::Path;
     use std::time::Duration;
@@ -820,27 +1013,6 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_args_request_low_latency_input_and_muxing() {
-        let cfg = CaptureConfig::default();
-        let args = build_ffmpeg_args(
-            1920,
-            1080,
-            Path::new("C:/temp"),
-            &cfg,
-            Some(AudioInput {
-                pipe_path: r"\\.\pipe\snapple_audio_42",
-                sample_rate: 48_000,
-            }),
-        );
-
-        assert!(args.windows(2).any(|w| w == ["-fflags", "nobuffer"]));
-        assert!(args.windows(2).any(|w| w == ["-flags", "low_delay"]));
-        assert!(args.windows(2).any(|w| w == ["-muxpreload", "0"]));
-        assert!(args.windows(2).any(|w| w == ["-muxdelay", "0"]));
-        assert!(args.windows(2).any(|w| w == ["-max_interleave_delta", "0"]));
-    }
-
-    #[test]
     fn auto_monitor_prefers_game_window_monitor() {
         assert_eq!(choose_monitor_target("auto", Some(2), 3), 2);
     }
@@ -849,5 +1021,184 @@ mod tests {
     fn invalid_or_out_of_range_monitor_falls_back_to_primary() {
         assert_eq!(choose_monitor_target("99", Some(2), 3), 1);
         assert_eq!(choose_monitor_target("bogus", Some(2), 3), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Black-bar prevention: output dimensions must be correct and even, and
+    // the downsample must fill every pixel of the output buffer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn output_dims_scale_height_preserves_aspect_ratio() {
+        // 16:9 monitor
+        assert_eq!(compute_output_dims("scale=-2:720", 2560, 1440), (1280, 720));
+        assert_eq!(compute_output_dims("scale=-2:720", 1920, 1080), (1280, 720));
+        assert_eq!(compute_output_dims("scale=-2:720", 3840, 2160), (1280, 720));
+    }
+
+    #[test]
+    fn output_dims_non_16_9_monitors_produce_even_width() {
+        // 16:10 laptop display
+        let (w, h) = compute_output_dims("scale=-2:720", 2880, 1800);
+        assert_eq!(h, 720);
+        assert_eq!(w % 2, 0, "width must be even for H.264, got {w}");
+        assert_eq!(w, 1152);
+    }
+
+    #[test]
+    fn output_dims_ultrawide_monitors() {
+        // 21:9 ultrawide
+        let (w, h) = compute_output_dims("scale=-2:720", 3440, 1440);
+        assert_eq!(h, 720);
+        assert_eq!(w % 2, 0, "width must be even, got {w}");
+        // 3440 * 720 / 1440 = 1720
+        assert_eq!(w, 1720);
+    }
+
+    #[test]
+    fn output_dims_scale_width_mode() {
+        let (w, h) = compute_output_dims("scale=1280:-2", 2560, 1440);
+        assert_eq!(w, 1280);
+        assert_eq!(h % 2, 0, "height must be even, got {h}");
+        assert_eq!(h, 720);
+    }
+
+    #[test]
+    fn output_dims_identity_when_scale_unparseable() {
+        // Unrecognised filter → pass through unchanged (no accidental crop)
+        assert_eq!(compute_output_dims("lanczos=720", 2560, 1440), (2560, 1440));
+        assert_eq!(compute_output_dims("", 2560, 1440), (2560, 1440));
+    }
+
+    #[test]
+    fn downsample_fills_entire_output_no_black_bars() {
+        // Create a source image filled with a non-black colour (0xFFBBGGRR).
+        let src_w: usize = 200;
+        let src_h: usize = 100;
+        let src_pitch = src_w * 4;
+        let src: Vec<u8> = vec![0xAB; src_pitch * src_h];
+
+        let dst_w: usize = 80;
+        let dst_h: usize = 40;
+        let mut dst = vec![0u8; dst_w * dst_h * 4];
+
+        unsafe {
+            downsample_bgra(
+                src.as_ptr(), src_w, src_h, src_pitch,
+                &mut dst, dst_w, dst_h,
+            );
+        }
+
+        // Every pixel in the output must be non-zero — any zeros would
+        // indicate black-bar padding that was never written.
+        for (i, chunk) in dst.chunks(4).enumerate() {
+            let x = i % dst_w;
+            let y = i / dst_w;
+            assert!(
+                chunk.iter().all(|&b| b == 0xAB),
+                "black pixel at output ({x}, {y}) — downsample left a gap"
+            );
+        }
+    }
+
+    #[test]
+    fn downsample_with_pitch_larger_than_width() {
+        // GPU staging textures often have a pitch > width*4 due to alignment.
+        let src_w: usize = 100;
+        let src_h: usize = 50;
+        let src_pitch: usize = 512; // much wider than 100*4=400
+        let mut src = vec![0u8; src_pitch * src_h];
+        // Fill only the valid pixel region with a marker colour.
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let off = y * src_pitch + x * 4;
+                src[off..off + 4].copy_from_slice(&[0xCC, 0xDD, 0xEE, 0xFF]);
+            }
+        }
+
+        let dst_w: usize = 50;
+        let dst_h: usize = 25;
+        let mut dst = vec![0u8; dst_w * dst_h * 4];
+
+        unsafe {
+            downsample_bgra(
+                src.as_ptr(), src_w, src_h, src_pitch,
+                &mut dst, dst_w, dst_h,
+            );
+        }
+
+        for (i, chunk) in dst.chunks(4).enumerate() {
+            let x = i % dst_w;
+            let y = i / dst_w;
+            assert_eq!(
+                chunk,
+                &[0xCC, 0xDD, 0xEE, 0xFF],
+                "wrong pixel at output ({x}, {y}) — pitch handling is broken"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Speed prevention: ffmpeg must receive frames whose byte size matches
+    // the declared -s WxH.  A mismatch causes ffmpeg to misalign frames,
+    // producing sped-up or garbled video.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ffmpeg_input_size_matches_prescaled_output() {
+        // Simulate the capture loop: compute output dims, then verify that
+        // the -s argument sent to ffmpeg matches the frame buffer size.
+        let cfg = CaptureConfig::default(); // scale=-2:720
+
+        // Various capture surface sizes that have caused issues.
+        let test_cases = [
+            (2880, 1800), // 16:10 laptop
+            (3840, 2160), // 4K
+            (2560, 1440), // 1440p
+            (1920, 1080), // 1080p
+            (1200, 675),  // loading screen
+        ];
+
+        for (cap_w, cap_h) in test_cases {
+            let (out_w, out_h) = compute_output_dims(&cfg.scale, cap_w, cap_h);
+            let args = build_ffmpeg_args(out_w, out_h, Path::new("C:/temp"), &cfg, None);
+
+            let expected_s = format!("{out_w}x{out_h}");
+            assert!(
+                args.windows(2).any(|w| w[0] == "-s" && w[1] == expected_s),
+                "for capture {cap_w}x{cap_h}: ffmpeg -s should be {expected_s}, args: {args:?}"
+            );
+
+            // The raw frame byte count the capture loop writes must equal
+            // what ffmpeg expects: width * height * 4 (BGRA).
+            let frame_bytes = out_w as usize * out_h as usize * 4;
+            assert!(
+                frame_bytes > 0,
+                "zero-size frame for capture {cap_w}x{cap_h}"
+            );
+
+            // Verify declared fps is present (speed regression guard).
+            assert!(
+                args.windows(2).any(|w| w == ["-r", &cfg.fps.to_string()]),
+                "fps not declared for capture {cap_w}x{cap_h}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_dims_always_even_for_h264_compatibility() {
+        // Odd dimensions cause H.264 encoder failures.  Test a range of
+        // awkward source sizes that could produce odd results.
+        let odd_sources = [
+            (1001, 563),
+            (2879, 1799),
+            (1921, 1081),
+            (3441, 1441),
+        ];
+        for (sw, sh) in odd_sources {
+            let (w, h) = compute_output_dims("scale=-2:720", sw, sh);
+            assert_eq!(w % 2, 0, "odd width {w} from source {sw}x{sh}");
+            assert_eq!(h % 2, 0, "odd height {h} from source {sw}x{sh}");
+        }
     }
 }

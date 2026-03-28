@@ -27,10 +27,12 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
 // AUDCLNT_BUFFERFLAGS
 const BUFFERFLAGS_SILENT: u32 = 0x0000_0002;
-// Let the shared-mode audio engine choose its low-latency default buffer size.
-const SHARED_BUFFER_DURATION_100NS: i64 = 0;
-// Live capture should prefer freshness over perfect backlog preservation.
-const MAX_PENDING_AUDIO_MS: usize = 100;
+// 1-second WASAPI buffer (in 100 ns units) — large enough that brief pipe
+// stalls or encoding back-pressure won't cause WASAPI to drop audio.
+const SHARED_BUFFER_DURATION_100NS: i64 = 10_000_000;
+// Safety cap on the pending buffer.  2 seconds is generous enough to absorb
+// startup transients and encoding spikes without discarding usable audio.
+const MAX_PENDING_AUDIO_MS: usize = 2000;
 
 /// Wraps a HANDLE so it can be sent to another thread.
 ///
@@ -494,8 +496,8 @@ mod tests {
     }
 
     #[test]
-    fn backlog_cap_is_small_enough_for_live_capture() {
+    fn backlog_cap_allows_generous_buffer() {
         let max_pending_values = 48_000usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
-        assert_eq!(max_pending_values, 9_600);
+        assert_eq!(max_pending_values, 192_000); // 2 seconds at 48 kHz stereo
     }
 }
