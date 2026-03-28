@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use windows::core::PCWSTR;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
@@ -59,6 +59,7 @@ impl AudioPipe {
     /// Call **before** spawning ffmpeg so the pipe path exists when ffmpeg opens it.
     pub fn start(
         mic_device: &str,
+        game_pid: u32,
         running: Arc<AtomicBool>,
         video_frames: Arc<AtomicU64>,
         video_fps: u64,
@@ -96,6 +97,7 @@ impl AudioPipe {
                 if let Err(e) = audio_thread(
                     handle,
                     &mic,
+                    game_pid,
                     sample_rate,
                     &running,
                     &video_frames,
@@ -156,7 +158,7 @@ fn is_float_format(tag: u16, bits: u16) -> bool {
     tag == WAVE_FORMAT_FLOAT || (tag == WAVE_FORMAT_EXTENSIBLE && bits == 32)
 }
 
-/// Open a WASAPI capture source.
+/// Open a WASAPI capture source on the default endpoint.
 ///
 /// * `data_flow` — `eRender` for loopback (game audio), `eCapture` for microphone.
 /// * `stream_flags` — pass `STREAMFLAGS_LOOPBACK` for loopback, `0` for mic.
@@ -165,6 +167,13 @@ fn open_wasapi(data_flow: EDataFlow, stream_flags: u32) -> Result<WasapiSource> 
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device = enumerator.GetDefaultAudioEndpoint(data_flow, eConsole)?;
+        open_wasapi_device(&device, stream_flags)
+    }
+}
+
+/// Open a WASAPI capture source on a specific `IMMDevice`.
+fn open_wasapi_device(device: &IMMDevice, stream_flags: u32) -> Result<WasapiSource> {
+    unsafe {
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let fmt = client.GetMixFormat()?;
 
@@ -192,6 +201,70 @@ fn open_wasapi(data_flow: EDataFlow, stream_flags: u32) -> Result<WasapiSource> 
             channels: ch,
             is_float: is_float_format(tag, bits),
         })
+    }
+}
+
+/// Find the render endpoint that has an active audio session belonging to
+/// `game_pid` and open loopback capture on it.  Falls back to the default
+/// render endpoint if the game's session isn't found.
+fn open_loopback_for_pid(game_pid: u32) -> Result<WasapiSource> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+
+        // Enumerate all active render endpoints.
+        let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        let count = devices.GetCount()?;
+
+        for i in 0..count {
+            let device = match devices.Item(i) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Get the session manager for this endpoint.
+            let mgr: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let session_enum = match mgr.GetSessionEnumerator() {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let session_count = match session_enum.GetCount() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            for j in 0..session_count {
+                let ctrl = match session_enum.GetSession(j) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let ctrl2: IAudioSessionControl2 = match ctrl.cast() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let pid = match ctrl2.GetProcessId() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if pid == game_pid {
+                    let dev_id = device.GetId()?.to_string().unwrap_or_default();
+                    log(&format!(
+                        "[snapple] found game audio session on device {dev_id} (pid {game_pid})"
+                    ));
+                    return open_wasapi_device(&device, STREAMFLAGS_LOOPBACK)
+                        .context("loopback on game device");
+                }
+            }
+        }
+
+        log(&format!(
+            "[snapple] no audio session found for pid {game_pid}, using default render device"
+        ));
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        open_wasapi_device(&device, STREAMFLAGS_LOOPBACK)
     }
 }
 
@@ -293,6 +366,7 @@ fn resample_stereo_into(data: &[f32], from: u32, to: u32, out: &mut Vec<f32>) {
 fn audio_thread(
     pipe: SendableHandle,
     mic_device: &str,
+    game_pid: u32,
     target_rate: u32,
     running: &AtomicBool,
     video_frames: &AtomicU64,
@@ -305,7 +379,7 @@ fn audio_thread(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let loopback = open_wasapi(eRender, STREAMFLAGS_LOOPBACK).context("loopback init")?;
+    let loopback = open_loopback_for_pid(game_pid).context("loopback init")?;
     log(&format!(
         "[snapple] audio loopback: {}Hz {}ch float={}",
         loopback.sample_rate, loopback.channels, loopback.is_float

@@ -213,6 +213,7 @@ fn capture_thread(
 
         let audio_pipe = match audio::AudioPipe::start(
             &resolved_cfg.microphone,
+            game_pid,
             running.clone(),
             video_frames.clone(),
             fps,
