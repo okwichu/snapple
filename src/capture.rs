@@ -733,25 +733,26 @@ unsafe fn downsample_bgra(
 // Encoder probing & fallback
 // ---------------------------------------------------------------------------
 
-/// Encoder presets: (encoder, preset, rate_control, quality_flag, quality).
+/// Encoder presets: (encoder, preset, rate_control, quality).
 const ENCODER_FALLBACKS: &[(&str, &str, &str, &str)] = &[
     // NVIDIA
-    ("h264_nvenc", "p4", "constqp", "28"),
+    ("h264_nvenc", "p4", "constqp", "20"),
     // AMD
-    ("h264_amf", "speed", "cqp", "28"),
-    // Software (always available) — ultrafast keeps up with 60 fps at 720p.
-    ("libx264", "ultrafast", "crf", "28"),
+    ("h264_amf", "balanced", "cqp", "20"),
+    // Software (always available)
+    ("libx264", "fast", "crf", "20"),
 ];
 
 /// Check if a given encoder is available in ffmpeg by doing a tiny test encode.
 fn probe_encoder(ffmpeg_path: &Path, encoder: &str) -> bool {
-    // Encode 1 frame of 16x16 black to /dev/null.
+    // Encode 1 frame to /dev/null. Use 256x256 because some HW encoders
+    // (notably AMD AMF) reject very small resolutions.
     let status = Command::new(ffmpeg_path)
         .args([
             "-hide_banner",
             "-loglevel", "error",
             "-f", "lavfi",
-            "-i", "color=black:s=16x16:d=0.01",
+            "-i", "color=black:s=256x256:d=0.01",
             "-frames:v", "1",
             "-c:v", encoder,
             "-f", "null",

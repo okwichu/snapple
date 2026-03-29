@@ -1,8 +1,11 @@
 # Snapple
-Snapple is a minimal Windows tray app to capture gaming video clips on my machine.
-It likely has some very specific dependencies on my setup that make it not distributable yet.
 
 Lightweight Windows game clip capture utility. Snapple runs in the system tray, automatically detects Steam games, and continuously records your screen. Press a hotkey to save the last 60 seconds as a clip.
+
+## What's new in v0.2
+
+- **Game audio capture fixed** — Snapple now detects which audio device the game is actually using (via WASAPI session enumeration) and captures from that device. Previously, loopback capture silently recorded from the wrong endpoint when the game used a non-default audio device.
+- Microphone mixing still supported alongside game audio.
 
 ## Requirements
 
