@@ -2,23 +2,27 @@
 
 Lightweight Windows game clip capture utility. Snapple runs in the system tray, automatically detects Steam games, and continuously records your screen. Press a hotkey to save the last 60 seconds as a clip.
 
-## What's new in v0.2
+## Features
 
-- **Game audio capture fixed** — Snapple now detects which audio device the game is actually using (via WASAPI session enumeration) and captures from that device. Previously, loopback capture silently recorded from the wrong endpoint when the game used a non-default audio device.
-- Microphone mixing still supported alongside game audio.
+- **Automatic game detection** — monitors Steam for running games, starts/stops recording automatically
+- **GPU-accelerated encoding** — auto-detects NVIDIA NVENC, AMD AMF, or falls back to CPU (libx264)
+- **Game audio capture** — detects the game's audio device via WASAPI session enumeration, even when the game uses a non-default output
+- **Microphone mixing** — optionally records mic audio alongside game audio
+- **Hotkey clip saving** — press F8 to save the last 60 seconds
+- **Direct window capture** — uses Windows.Graphics.Capture for low-overhead, borderless-compatible capture
 
 ## Requirements
 
 - Windows 10 (1903+) or Windows 11
 - [FFmpeg](https://ffmpeg.org/) — install with `winget install Gyan.FFmpeg`, or place `ffmpeg.exe` next to `Snapple.exe`
-- A GPU with hardware encoding support (NVIDIA, AMD, or software fallback — see [encoder config](#capture))
+- A GPU with hardware encoding support (NVIDIA or AMD) is recommended but not required
 
 ## Usage
 
 1. Run `Snapple.exe`. It appears in the system tray.
 2. Launch a Steam game. Snapple automatically starts recording.
 3. Press **F8** (default) to save the last 60 seconds as a clip.
-4. Clips are saved to `~/Videos/Snapple` by default.
+4. Clips are saved to `D:\Clips` by default.
 
 ## Configuration
 
@@ -27,7 +31,7 @@ Place a `snapple.toml` file next to `Snapple.exe` to customize behavior. All fie
 ### Example `snapple.toml`
 
 ```toml
-# Where clips are saved. Default: your Videos folder under "Snapple".
+# Where clips are saved.
 clips_dir = "D:/Clips"
 
 # Hotkey to save a clip.
@@ -46,6 +50,7 @@ scale = "scale=-2:720"
 #   NVIDIA:  "h264_nvenc"
 #   AMD:     "h264_amf"
 #   CPU:     "libx264"  (slow, but works everywhere)
+# If the configured encoder isn't available, Snapple auto-detects a working one.
 encoder = "h264_nvenc"
 
 # Encoder preset. Controls speed vs quality tradeoff.
@@ -56,14 +61,15 @@ preset = "p4"
 
 # Rate control mode.
 #   NVENC:   "constqp" or "vbr"
-#   libx264: "crf" (use quality field for CRF value, e.g. "23")
+#   libx264: "crf" (use quality field for CRF value, e.g. "20")
 #   AMF:     "cqp"
 rate_control = "constqp"
 
 # Quality parameter (lower = better quality, larger files).
-#   NVENC constqp: "20"-"35" typical (QP value)
-#   libx264 crf:   "18"-"28" typical (CRF value)
-quality = "28"
+#   NVENC constqp: "16"-"28" typical (QP value)
+#   libx264 crf:   "18"-"23" typical (CRF value)
+#   AMF cqp:       "16"-"28" typical (QP value)
+quality = "20"
 
 # Duration of each recording segment in seconds.
 # Shorter segments = more responsive clip saving, slightly more overhead.
@@ -73,6 +79,9 @@ segment_time = 5
 #   "auto" — automatically captures the monitor the game window is on (default)
 #   "1", "2", etc. — capture a specific monitor by index
 monitor = "auto"
+
+# Microphone device: "default" for system default, "none" to disable.
+microphone = "default"
 
 [buffer]
 # Number of segments to include when saving a clip.
@@ -95,9 +104,9 @@ poll_interval_secs = 5
 
 | GPU | encoder | preset | rate_control | quality |
 |-----|---------|--------|-------------|---------|
-| NVIDIA | `h264_nvenc` | `p4` | `constqp` | `28` |
-| AMD | `h264_amf` | `balanced` | `cqp` | `28` |
-| CPU (any) | `libx264` | `fast` | `crf` | `23` |
+| NVIDIA | `h264_nvenc` | `p4` | `constqp` | `20` |
+| AMD | `h264_amf` | `balanced` | `cqp` | `20` |
+| CPU (any) | `libx264` | `fast` | `crf` | `20` |
 
 ## Building from source
 
