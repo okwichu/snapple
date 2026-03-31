@@ -128,13 +128,21 @@ fn run() -> Result<()> {
     // Build tray menu
     let status_item = MenuItem::new("Snapple \u{2014} Idle", false, None);
     let mic_item = CheckMenuItem::new("Record Microphone", true, true, None);
+    let startup_item = CheckMenuItem::new("Start with Windows", true, is_startup_enabled(), None);
     let separator = PredefinedMenuItem::separator();
     let open_clips = MenuItem::new("Open Clips Folder", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
+    // Enable startup by default on first run.
+    if !is_startup_enabled() {
+        set_startup_enabled(true);
+        startup_item.set_checked(true);
+    }
+
     let menu = Menu::new();
     menu.append(&status_item)?;
     menu.append(&mic_item)?;
+    menu.append(&startup_item)?;
     menu.append(&separator)?;
     menu.append(&open_clips)?;
     menu.append(&quit_item)?;
@@ -154,7 +162,7 @@ fn run() -> Result<()> {
 
     // Start game monitor
     let (game_tx, game_rx) = mpsc::channel();
-    let _monitor_handle = games::spawn_monitor(game_tx, cfg.steam.clone());
+    let _monitor_handle = games::spawn_monitor(game_tx, cfg.steam.clone(), cfg.extra_games.clone());
 
     // App state
     let mut current_game: Option<String> = None;
@@ -234,6 +242,9 @@ fn run() -> Result<()> {
                     .arg(cfg.clips_dir.as_os_str())
                     .spawn();
             }
+            if event.id() == startup_item.id() {
+                set_startup_enabled(startup_item.is_checked());
+            }
         }
 
         // Handle hotkey — only save if there is an active capture session.
@@ -275,6 +286,39 @@ fn run() -> Result<()> {
     let _ = std::fs::remove_dir_all(&seg_dir);
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Windows startup (Run registry key)
+// ---------------------------------------------------------------------------
+
+const STARTUP_REG_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const STARTUP_REG_VALUE: &str = "Snapple";
+
+fn is_startup_enabled() -> bool {
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let Ok(run_key) = hkcu.open_subkey(STARTUP_REG_KEY) else {
+        return false;
+    };
+    run_key.get_value::<String, _>(STARTUP_REG_VALUE).is_ok()
+}
+
+fn set_startup_enabled(enable: bool) {
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    if enable {
+        let exe = std::env::current_exe().unwrap_or_default();
+        if let Ok(run_key) = hkcu.open_subkey_with_flags(
+            STARTUP_REG_KEY,
+            winreg::enums::KEY_SET_VALUE,
+        ) {
+            let _ = run_key.set_value(STARTUP_REG_VALUE, &exe.to_string_lossy().as_ref());
+        }
+    } else if let Ok(run_key) = hkcu.open_subkey_with_flags(
+        STARTUP_REG_KEY,
+        winreg::enums::KEY_SET_VALUE,
+    ) {
+        let _ = run_key.delete_value(STARTUP_REG_VALUE);
+    }
 }
 
 fn main() {

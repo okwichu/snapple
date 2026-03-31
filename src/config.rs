@@ -11,6 +11,12 @@ pub fn exe_sibling(filename: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(filename))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtraGame {
+    pub name: String,
+    pub exe: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -19,6 +25,7 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub buffer: BufferConfig,
     pub steam: SteamConfig,
+    pub extra_games: Vec<ExtraGame>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,8 +67,18 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             buffer: BufferConfig::default(),
             steam: SteamConfig::default(),
+            extra_games: default_extra_games(),
         }
     }
+}
+
+fn default_extra_games() -> Vec<ExtraGame> {
+    vec![
+        ExtraGame {
+            name: "Fortnite".into(),
+            exe: "FortniteClient-Win64-Shipping.exe".into(),
+        },
+    ]
 }
 
 impl Default for CaptureConfig {

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use sysinfo::System;
 
-use crate::config::SteamConfig;
+use crate::config::{ExtraGame, SteamConfig};
 
 /// Extract quoted key-value pairs from VDF/ACF text.
 fn parse_kv_pairs(text: &str) -> Vec<(String, String)> {
@@ -130,11 +130,22 @@ fn next_game_event(
     }
 }
 
-/// Polls running processes to detect Steam games.
-pub fn spawn_monitor(tx: mpsc::Sender<GameEvent>, steam_cfg: SteamConfig) -> thread::JoinHandle<()> {
+/// Polls running processes to detect Steam and non-Steam games.
+pub fn spawn_monitor(
+    tx: mpsc::Sender<GameEvent>,
+    steam_cfg: SteamConfig,
+    extra_games: Vec<ExtraGame>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let games = load_steam_games(&steam_cfg.path, &steam_cfg.skip_appids);
+        let steam_games = load_steam_games(&steam_cfg.path, &steam_cfg.skip_appids);
         let marker = "steamapps\\common\\";
+
+        // Pre-lowercase extra game exe names for fast comparison.
+        let extra: Vec<(String, String)> = extra_games
+            .iter()
+            .map(|g| (g.exe.to_lowercase(), g.name.clone()))
+            .collect();
+
         let mut current_game: Option<(String, u32)> = None;
         let mut sys = System::new();
 
@@ -148,15 +159,31 @@ pub fn spawn_monitor(tx: mpsc::Sender<GameEvent>, steam_cfg: SteamConfig) -> thr
                     None => continue,
                 };
                 let exe_str = exe.to_string_lossy().to_lowercase();
+
+                // Check Steam games (by install directory).
                 if let Some(idx) = exe_str.find(marker) {
                     let after = &exe_str[idx + marker.len()..];
                     let installdir = match after.split('\\').next() {
                         Some(d) => d,
                         None => continue,
                     };
-                    for (dir, name) in &games {
+                    for (dir, name) in &steam_games {
                         if dir == installdir {
                             detected = Some((name.clone(), pid.as_u32()));
+                            break;
+                        }
+                    }
+                    if detected.is_some() {
+                        break;
+                    }
+                }
+
+                // Check extra (non-Steam) games by executable name.
+                if let Some(file_name) = exe.file_name() {
+                    let file_lower = file_name.to_string_lossy().to_lowercase();
+                    for (exe_name, game_name) in &extra {
+                        if file_lower == *exe_name {
+                            detected = Some((game_name.clone(), pid.as_u32()));
                             break;
                         }
                     }
