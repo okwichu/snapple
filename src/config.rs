@@ -72,7 +72,7 @@ impl Default for CaptureConfig {
             encoder: "h264_nvenc".into(),
             preset: "p4".into(),
             rate_control: "constqp".into(),
-            quality: "20".into(),
+            quality: "16".into(),
             segment_time: 5,
             monitor: "auto".into(),
             microphone: "default".into(),

@@ -83,7 +83,7 @@ pub fn save_clip(
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let output = clips_dir.join(format!("{safe_name}_{timestamp}.mp4"));
 
-    // Re-encode audio to eliminate AAC priming artifacts at segment
+    // Re-encode audio to eliminate AAC priming-sample artifacts at segment
     // boundaries; video is still stream-copied (fast).
     let status = Command::new(ffmpeg_path)
         .args([
@@ -99,7 +99,9 @@ pub fn save_clip(
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            "320k",
+            "-aac_coder",
+            "twoloop",
             &output.to_string_lossy(),
         ])
         .creation_flags(CREATE_NO_WINDOW)

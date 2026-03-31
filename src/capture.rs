@@ -736,11 +736,11 @@ unsafe fn downsample_bgra(
 /// Encoder presets: (encoder, preset, rate_control, quality).
 const ENCODER_FALLBACKS: &[(&str, &str, &str, &str)] = &[
     // NVIDIA
-    ("h264_nvenc", "p4", "constqp", "20"),
+    ("h264_nvenc", "p4", "constqp", "16"),
     // AMD
-    ("h264_amf", "balanced", "cqp", "20"),
+    ("h264_amf", "balanced", "cqp", "16"),
     // Software (always available)
-    ("libx264", "fast", "crf", "20"),
+    ("libx264", "fast", "crf", "16"),
 ];
 
 /// Check if a given encoder is available in ffmpeg by doing a tiny test encode.
@@ -845,6 +845,10 @@ fn build_ffmpeg_args(
 
     let mut args: Vec<String> = vec!["-y".into()];
 
+    // Use wall-clock timestamps so that video duration matches real time
+    // even when the capture loop can't sustain the target framerate.
+    args.extend(["-use_wallclock_as_timestamps".into(), "1".into()]);
+
     args.extend([
         "-f".into(),
         "rawvideo".into(),
@@ -891,9 +895,15 @@ fn build_ffmpeg_args(
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
-            "192k".into(),
+            "320k".into(),
+            "-aac_coder".into(),
+            "twoloop".into(),
         ]);
     }
+
+    // Output at the target framerate — ffmpeg will duplicate or drop frames
+    // to maintain constant fps, compensating for any capture-loop jitter.
+    args.extend(["-r".into(), cfg.fps.to_string()]);
 
     args.extend([
         "-f".into(),
@@ -978,7 +988,7 @@ mod tests {
             encoder: "h264_nvenc".into(),
             preset: "p4".into(),
             rate_control: "constqp".into(),
-            quality: "28".into(),
+            quality: "16".into(),
             segment_time: 5,
             monitor: "auto".into(),
             microphone: "default".into(),
@@ -986,6 +996,7 @@ mod tests {
 
         let args = build_ffmpeg_args(2560, 1440, Path::new("C:/temp"), &cfg, None);
 
+        assert!(args.windows(2).any(|w| w == ["-use_wallclock_as_timestamps", "1"]));
         assert!(args.windows(2).any(|w| w == ["-vf", "scale=-2:720"]));
         assert!(args.windows(2).any(|w| w == ["-r", "60"]));
         assert!(args.windows(2).any(|w| w == ["-s", "2560x1440"]));
@@ -1009,7 +1020,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-ac", "2"]));
         assert!(args.windows(2).any(|w| w == ["-i", r"\\.\pipe\snapple_audio_42"]));
         assert!(args.windows(2).any(|w| w == ["-c:a", "aac"]));
-        assert!(args.windows(2).any(|w| w == ["-b:a", "192k"]));
+        assert!(args.windows(2).any(|w| w == ["-b:a", "320k"]));
     }
 
     #[test]
@@ -1039,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_bitrate_is_192k() {
+    fn audio_bitrate_is_320k() {
         let cfg = CaptureConfig::default();
         let args = build_ffmpeg_args(
             1920,
@@ -1053,8 +1064,8 @@ mod tests {
         );
 
         assert!(
-            args.windows(2).any(|w| w == ["-b:a", "192k"]),
-            "audio bitrate must be 192k, got args: {args:?}"
+            args.windows(2).any(|w| w == ["-b:a", "320k"]),
+            "audio bitrate must be 320k, got args: {args:?}"
         );
         assert!(
             !args.windows(2).any(|w| w == ["-b:a", "128k"]),
