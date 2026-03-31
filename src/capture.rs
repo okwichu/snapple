@@ -213,6 +213,7 @@ fn capture_thread(
 
         let audio_pipe = match audio::AudioPipe::start(
             &resolved_cfg.microphone,
+            resolved_cfg.mic_volume,
             game_pid,
             running.clone(),
             video_frames.clone(),
@@ -992,6 +993,7 @@ mod tests {
             segment_time: 5,
             monitor: "auto".into(),
             microphone: "default".into(),
+            mic_volume: 0.15,
         };
 
         let args = build_ffmpeg_args(2560, 1440, Path::new("C:/temp"), &cfg, None);

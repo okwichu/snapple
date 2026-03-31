@@ -59,6 +59,7 @@ impl AudioPipe {
     /// Call **before** spawning ffmpeg so the pipe path exists when ffmpeg opens it.
     pub fn start(
         mic_device: &str,
+        mic_volume: f32,
         game_pid: u32,
         running: Arc<AtomicBool>,
         video_frames: Arc<AtomicU64>,
@@ -97,6 +98,7 @@ impl AudioPipe {
                 if let Err(e) = audio_thread(
                     handle,
                     &mic,
+                    mic_volume,
                     game_pid,
                     sample_rate,
                     &running,
@@ -366,6 +368,7 @@ fn resample_stereo_into(data: &[f32], from: u32, to: u32, out: &mut Vec<f32>) {
 fn audio_thread(
     pipe: SendableHandle,
     mic_device: &str,
+    mic_volume: f32,
     game_pid: u32,
     target_rate: u32,
     running: &AtomicBool,
@@ -496,7 +499,7 @@ fn audio_thread(
 
             let overlap = lb.len().min(mic_data.len());
             for i in 0..overlap {
-                pending[base + i] = (lb[i] + mic_data[i]).clamp(-1.0, 1.0);
+                pending[base + i] = (lb[i] + mic_data[i] * mic_volume).clamp(-1.0, 1.0);
             }
             let tail: &[f32] = if lb.len() > mic_data.len() {
                 &lb[overlap..]
@@ -504,7 +507,8 @@ fn audio_thread(
                 &mic_data[overlap..]
             };
             for (j, &s) in tail.iter().enumerate() {
-                pending[base + overlap + j] = s.clamp(-1.0, 1.0);
+                let v = if lb.len() > mic_data.len() { s } else { s * mic_volume };
+                pending[base + overlap + j] = v.clamp(-1.0, 1.0);
             }
         }
 
