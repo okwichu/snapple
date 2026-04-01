@@ -209,6 +209,11 @@ fn open_wasapi_device(device: &IMMDevice, stream_flags: u32) -> Result<WasapiSou
 /// Find the render endpoint that has an active audio session belonging to
 /// `game_pid` and open loopback capture on it.  Falls back to the default
 /// render endpoint if the game's session isn't found.
+///
+/// Currently unused — we always capture the default render device because
+/// PID-based lookup can land on the wrong endpoint (e.g. HDMI output).
+/// Kept for future use if we add silence-detection fallback.
+#[allow(dead_code)]
 fn open_loopback_for_pid(game_pid: u32) -> Result<WasapiSource> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
