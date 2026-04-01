@@ -340,12 +340,24 @@ fn capture_thread(
             if has_first_frame {
                 let origin = *pacing_origin.get_or_insert_with(Instant::now);
 
-                if stdin.write_all(&last_frame).is_err() {
-                    log("[snapple] ffmpeg pipe broken, stopping capture");
-                    break;
+                // How many frames should have been written by now to
+                // maintain real-time playback.  Write duplicates of the
+                // current frame to catch up (capped to avoid a stall
+                // spiral if the pipe is the bottleneck).
+                let elapsed_us = origin.elapsed().as_micros() as u64;
+                let target = elapsed_us * fps / 1_000_000;
+                let behind = target.saturating_sub(frame_count);
+                let writes = 1 + behind.min(4);
+
+                for _ in 0..writes {
+                    if stdin.write_all(&last_frame).is_err() {
+                        log("[snapple] ffmpeg pipe broken, stopping capture");
+                        needs_restart = false; // force exit
+                        break;
+                    }
+                    video_frames.fetch_add(1, Ordering::Relaxed);
+                    frame_count += 1;
                 }
-                video_frames.fetch_add(1, Ordering::Relaxed);
-                frame_count += 1;
 
                 let next_due_us = frame_count * 1_000_000 / fps;
                 let next_due = origin + Duration::from_micros(next_due_us);
@@ -846,10 +858,6 @@ fn build_ffmpeg_args(
 
     let mut args: Vec<String> = vec!["-y".into()];
 
-    // Use wall-clock timestamps so that video duration matches real time
-    // even when the capture loop can't sustain the target framerate.
-    args.extend(["-use_wallclock_as_timestamps".into(), "1".into()]);
-
     args.extend([
         "-f".into(),
         "rawvideo".into(),
@@ -901,10 +909,6 @@ fn build_ffmpeg_args(
             "twoloop".into(),
         ]);
     }
-
-    // Output at the target framerate — ffmpeg will duplicate or drop frames
-    // to maintain constant fps, compensating for any capture-loop jitter.
-    args.extend(["-r".into(), cfg.fps.to_string()]);
 
     args.extend([
         "-f".into(),
@@ -998,7 +1002,6 @@ mod tests {
 
         let args = build_ffmpeg_args(2560, 1440, Path::new("C:/temp"), &cfg, None);
 
-        assert!(args.windows(2).any(|w| w == ["-use_wallclock_as_timestamps", "1"]));
         assert!(args.windows(2).any(|w| w == ["-vf", "scale=-2:720"]));
         assert!(args.windows(2).any(|w| w == ["-r", "60"]));
         assert!(args.windows(2).any(|w| w == ["-s", "2560x1440"]));
