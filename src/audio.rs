@@ -369,7 +369,7 @@ fn audio_thread(
     pipe: SendableHandle,
     mic_device: &str,
     mic_volume: f32,
-    game_pid: u32,
+    _game_pid: u32,
     target_rate: u32,
     running: &AtomicBool,
     video_frames: &AtomicU64,
@@ -382,7 +382,10 @@ fn audio_thread(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let loopback = open_loopback_for_pid(game_pid).context("loopback init")?;
+    // Always capture from the default render device.  PID-based device
+    // lookup can land on the wrong endpoint (e.g. an HDMI output that
+    // isn't actually carrying audio), producing silence.
+    let loopback = open_wasapi(eRender, STREAMFLAGS_LOOPBACK).context("loopback init")?;
     log(&format!(
         "[snapple] audio loopback: {}Hz {}ch float={}",
         loopback.sample_rate, loopback.channels, loopback.is_float
@@ -492,23 +495,21 @@ fn audio_thread(
         };
 
         // --- mix into pending buffer ---
-        let len = lb.len().max(mic_data.len());
+        // Loopback is the master timeline — its length determines how many
+        // samples are appended.  Mic samples beyond the loopback length are
+        // discarded; splicing them in would insert discontinuities into the
+        // game audio waveform, causing a gritty buzz.
+        let len = lb.len();
         if len > 0 {
             let base = pending.len();
             pending.resize(base + len, 0.0);
 
-            let overlap = lb.len().min(mic_data.len());
+            let overlap = len.min(mic_data.len());
             for i in 0..overlap {
                 pending[base + i] = (lb[i] + mic_data[i] * mic_volume).clamp(-1.0, 1.0);
             }
-            let tail: &[f32] = if lb.len() > mic_data.len() {
-                &lb[overlap..]
-            } else {
-                &mic_data[overlap..]
-            };
-            for (j, &s) in tail.iter().enumerate() {
-                let v = if lb.len() > mic_data.len() { s } else { s * mic_volume };
-                pending[base + overlap + j] = v.clamp(-1.0, 1.0);
+            for i in overlap..len {
+                pending[base + i] = lb[i];
             }
         }
 
