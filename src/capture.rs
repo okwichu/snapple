@@ -30,6 +30,7 @@ use crate::{buffer, log, CREATE_NO_WINDOW};
 pub struct CaptureSession {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    frame_counter: Arc<AtomicU64>,
 }
 
 impl CaptureSession {
@@ -42,6 +43,8 @@ impl CaptureSession {
     ) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        let frame_counter = Arc::new(AtomicU64::new(0));
+        let frame_counter_clone = frame_counter.clone();
 
         let thread = thread::Builder::new()
             .name("capture".into())
@@ -53,6 +56,7 @@ impl CaptureSession {
                     &capture_cfg,
                     cleanup_age_secs,
                     game_pid,
+                    frame_counter_clone,
                 ) {
                     log(&format!("[snapple] capture error: {e:#}"));
                 }
@@ -62,13 +66,60 @@ impl CaptureSession {
         Ok(Self {
             running,
             thread: Some(thread),
+            frame_counter,
         })
+    }
+
+    /// Number of video frames successfully captured (cumulative across pipeline restarts).
+    pub fn frame_count(&self) -> u64 {
+        self.frame_counter.load(Ordering::Relaxed)
+    }
+
+    /// Whether the capture thread is still running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Check whether the capture appears stalled.  Returns `true` when the
+    /// caller should tear down this session and start a fresh one.
+    ///
+    /// `last_frame_count` / `last_check` / `start_time` are the caller's
+    /// bookkeeping from the previous health-check cycle.
+    pub fn needs_restart(
+        &self,
+        last_frame_count: u64,
+        last_check: Instant,
+        start_time: Option<Instant>,
+    ) -> bool {
+        if !self.is_running() {
+            return true;
+        }
+        if last_check.elapsed() >= Duration::from_secs(5) {
+            let past_grace = start_time
+                .map(|t| t.elapsed() >= Duration::from_secs(10))
+                .unwrap_or(false);
+            past_grace && self.frame_count() == last_frame_count
+        } else {
+            false
+        }
     }
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+impl CaptureSession {
+    /// Create a dummy session for unit tests (no thread, no D3D).
+    fn dummy() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(true)),
+            thread: None,
+            frame_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -86,6 +137,7 @@ fn capture_thread(
     capture_cfg: &CaptureConfig,
     cleanup_age_secs: u64,
     game_pid: u32,
+    frame_counter: Arc<AtomicU64>,
 ) -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -285,6 +337,18 @@ fn capture_thread(
             if last_cleanup.elapsed() > Duration::from_secs(10) {
                 let _ = buffer::cleanup_old_segments(seg_dir, cleanup_age_secs);
                 last_cleanup = Instant::now();
+
+                // Periodic device-health check — catches the case where
+                // TryGetNextFrame silently fails but the pacing loop keeps
+                // writing frozen duplicate frames.
+                if let Err(e) = unsafe { d3d_device.GetDeviceRemovedReason() } {
+                    log(&format!(
+                        "[snapple] D3D device removed ({:#010x}), stopping capture",
+                        e.code().0 as u32,
+                    ));
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
             }
 
             if let Ok(frame) = frame_pool.TryGetNextFrame() {
@@ -311,6 +375,17 @@ fn capture_thread(
                         if let Ok(texture) = unsafe { dxgi_access.GetInterface::<ID3D11Texture2D>() } {
                             unsafe {
                                 d3d_context.CopyResource(&staging, &texture);
+
+                                // Detect GPU device loss (sleep/resume, GPU switch, driver reset).
+                                if let Err(e) = d3d_device.GetDeviceRemovedReason() {
+                                    log(&format!(
+                                        "[snapple] D3D device removed ({:#010x}), stopping capture",
+                                        e.code().0 as u32,
+                                    ));
+                                    let _ = frame.Close();
+                                    running.store(false, Ordering::Relaxed);
+                                    break;
+                                }
 
                                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                                 if d3d_context
@@ -356,6 +431,7 @@ fn capture_thread(
                         break;
                     }
                     video_frames.fetch_add(1, Ordering::Relaxed);
+                    frame_counter.fetch_add(1, Ordering::Relaxed);
                     frame_count += 1;
                 }
 
@@ -973,11 +1049,12 @@ fn drain_ffmpeg_stderr(child: &mut Child) {
 mod tests {
     use super::{
         build_ffmpeg_args, choose_monitor_target, compute_output_dims, downsample_bgra,
-        frame_interval, AudioInput,
+        frame_interval, AudioInput, CaptureSession,
     };
     use crate::config::CaptureConfig;
     use std::path::Path;
-    use std::time::Duration;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn uses_declared_fps_for_real_time_pacing() {
@@ -1266,5 +1343,92 @@ mod tests {
             assert_eq!(w % 2, 0, "odd width {w} from source {sw}x{sh}");
             assert_eq!(h % 2, 0, "odd height {h} from source {sw}x{sh}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Health-check / device-loss recovery
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn needs_restart_when_thread_exited() {
+        let session = CaptureSession::dummy();
+        session.running.store(false, Ordering::Relaxed);
+
+        assert!(
+            session.needs_restart(0, Instant::now(), Some(Instant::now())),
+            "should restart when the capture thread is no longer running"
+        );
+    }
+
+    #[test]
+    fn no_restart_during_grace_period() {
+        let session = CaptureSession::dummy();
+        // Frame count stuck at zero, but we're still within the 10s grace period.
+        let start = Instant::now();
+        let old_check = start - Duration::from_secs(6); // >5s ago → eligible for stall check
+
+        assert!(
+            !session.needs_restart(0, old_check, Some(start)),
+            "should not restart during the 10-second startup grace period"
+        );
+    }
+
+    #[test]
+    fn restart_on_frame_stall_after_grace() {
+        let session = CaptureSession::dummy();
+        // Simulate: capture started 15s ago, last check was 6s ago, counter stuck at 100.
+        let start = Instant::now() - Duration::from_secs(15);
+        let old_check = Instant::now() - Duration::from_secs(6);
+        session.frame_counter.store(100, Ordering::Relaxed);
+
+        assert!(
+            session.needs_restart(100, old_check, Some(start)),
+            "should restart when frame count is stuck after grace period"
+        );
+    }
+
+    #[test]
+    fn no_restart_when_frames_advancing() {
+        let session = CaptureSession::dummy();
+        // Simulate: capture started 15s ago, last check 6s ago, but counter advanced.
+        let start = Instant::now() - Duration::from_secs(15);
+        let old_check = Instant::now() - Duration::from_secs(6);
+        session.frame_counter.store(200, Ordering::Relaxed);
+
+        assert!(
+            !session.needs_restart(100, old_check, Some(start)),
+            "should not restart when frame count is advancing"
+        );
+    }
+
+    #[test]
+    fn no_restart_when_check_interval_not_elapsed() {
+        let session = CaptureSession::dummy();
+        // Even if counter is stuck, don't check until 5s have passed.
+        let start = Instant::now() - Duration::from_secs(15);
+        let recent_check = Instant::now(); // just checked
+
+        assert!(
+            !session.needs_restart(0, recent_check, Some(start)),
+            "should not restart before the 5-second check interval"
+        );
+    }
+
+    #[test]
+    fn frame_count_reflects_shared_counter() {
+        let session = CaptureSession::dummy();
+        assert_eq!(session.frame_count(), 0);
+
+        session.frame_counter.fetch_add(42, Ordering::Relaxed);
+        assert_eq!(session.frame_count(), 42);
+    }
+
+    #[test]
+    fn is_running_reflects_shared_flag() {
+        let session = CaptureSession::dummy();
+        assert!(session.is_running());
+
+        session.running.store(false, Ordering::Relaxed);
+        assert!(!session.is_running());
     }
 }

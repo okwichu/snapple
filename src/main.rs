@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use global_hotkey::hotkey::{Code, HotKey};
@@ -168,6 +168,10 @@ fn run() -> Result<()> {
     let mut current_game: Option<String> = None;
     let mut capture_session: Option<capture::CaptureSession> = None;
     let cleanup_age = cfg.cleanup_age_secs();
+    let mut current_game_pid: Option<u32> = None;
+    let mut last_frame_count: u64 = 0;
+    let mut last_frame_check = Instant::now();
+    let mut capture_start_time: Option<Instant> = None;
 
     log("[snapple] ready — waiting for a Steam game to launch");
 
@@ -209,12 +213,18 @@ fn run() -> Result<()> {
                         Ok(session) => {
                             capture_session = Some(session);
                             current_game = Some(name.clone());
+                            current_game_pid = Some(pid);
+                            capture_start_time = Some(Instant::now());
+                            last_frame_count = 0;
+                            last_frame_check = Instant::now();
                             status_item.set_text(format!("Snapple \u{2014} Recording {name}"));
                             log("[snapple] capture started");
                         }
                         Err(e) => {
                             // Capture failed — don't claim we're recording.
                             current_game = None;
+                            current_game_pid = None;
+                            capture_start_time = None;
                             status_item.set_text("Snapple \u{2014} Idle");
                             log(&format!("[snapple] failed to start capture: {e:#}"));
                         }
@@ -226,6 +236,8 @@ fn run() -> Result<()> {
                         session.stop();
                     }
                     current_game = None;
+                    current_game_pid = None;
+                    capture_start_time = None;
                     status_item.set_text("Snapple \u{2014} Idle");
                 }
             }
@@ -255,8 +267,6 @@ fn run() -> Result<()> {
                         "[snapple] {} pressed — saving clip for {game}",
                         cfg.hotkey
                     ));
-                    sound::play_shutter(&shutter_wav);
-
                     match buffer::save_clip(
                         &seg_dir,
                         game,
@@ -264,7 +274,10 @@ fn run() -> Result<()> {
                         &cfg.clips_dir,
                         cfg.buffer.segments,
                     ) {
-                        Ok(path) => log(&format!("[snapple] clip saved: {}", path.display())),
+                        Ok(path) => {
+                            sound::play_shutter(&shutter_wav);
+                            log(&format!("[snapple] clip saved: {}", path.display()));
+                        }
                         Err(e) => log(&format!("[snapple] save failed: {e:#}")),
                     }
                 }
@@ -273,6 +286,61 @@ fn run() -> Result<()> {
                     "[snapple] {} pressed but no active capture",
                     cfg.hotkey
                 ));
+            }
+        }
+
+        // Health check: detect stalled or dead capture and auto-restart.
+        let should_restart = if let Some(ref session) = capture_session {
+            let restart = session.needs_restart(
+                last_frame_count,
+                last_frame_check,
+                capture_start_time,
+            );
+            if restart {
+                log("[snapple] capture needs restart (thread exited or frames stalled)");
+            } else if last_frame_check.elapsed() >= Duration::from_secs(5) {
+                // Refresh bookkeeping for the next cycle.
+                last_frame_count = session.frame_count();
+                last_frame_check = Instant::now();
+            }
+            restart
+        } else {
+            false
+        };
+
+        if should_restart {
+            if let Some(mut old) = capture_session.take() {
+                old.stop();
+            }
+
+            if let (Some(game_name), Some(pid)) = (&current_game, current_game_pid) {
+                let mut cap_cfg = cfg.capture.clone();
+                if !mic_item.is_checked() {
+                    cap_cfg.microphone = "none".into();
+                }
+
+                match capture::CaptureSession::start(
+                    seg_dir.clone(),
+                    ffmpeg_path.clone(),
+                    cap_cfg,
+                    cleanup_age,
+                    pid,
+                ) {
+                    Ok(new_session) => {
+                        capture_session = Some(new_session);
+                        capture_start_time = Some(Instant::now());
+                        last_frame_count = 0;
+                        last_frame_check = Instant::now();
+                        log(&format!("[snapple] capture restarted for {game_name}"));
+                    }
+                    Err(e) => {
+                        log(&format!("[snapple] failed to restart capture: {e:#}"));
+                        current_game = None;
+                        current_game_pid = None;
+                        capture_start_time = None;
+                        status_item.set_text("Snapple \u{2014} Idle");
+                    }
+                }
             }
         }
 
