@@ -108,6 +108,13 @@ poll_interval_secs = 5
 | AMD | `h264_amf` | `balanced` | `cqp` | `20` |
 | CPU (any) | `libx264` | `fast` | `crf` | `20` |
 
+## Changelog
+
+### 1.0.1
+
+- Fixed an edge case where capture silently stops after system sleep/resume or GPU disconnect (e.g. unplugging a laptop from an external GPU). Snapple now detects D3D device loss and automatically restarts the capture pipeline.
+- Shutter sound now only plays when a clip is actually saved.
+
 ## Building from source
 
 ```

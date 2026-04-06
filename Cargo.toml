@@ -1,6 +1,6 @@
 [package]
 name = "Snapple"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["okwic"]
 description = "Lightweight Windows game clip capture utility"
