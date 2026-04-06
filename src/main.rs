@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use global_hotkey::hotkey::{Code, HotKey};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::TrayIconBuilder;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -260,8 +260,10 @@ fn run() -> Result<()> {
         }
 
         // Handle hotkey — only save if there is an active capture session.
-        if let Ok(_event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if capture_session.is_some() {
+        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if event.state() != HotKeyState::Pressed {
+                // Ignore key-up events to prevent double saves.
+            } else if capture_session.is_some() {
                 if let Some(game) = current_game.as_deref() {
                     log(&format!(
                         "[snapple] {} pressed — saving clip for {game}",
