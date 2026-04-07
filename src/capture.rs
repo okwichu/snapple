@@ -184,7 +184,7 @@ fn capture_thread(
     let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2,
+        4, // larger pool to avoid dropping frames before we drain them
         size,
     )?;
     let session = frame_pool.CreateCaptureSession(&item)?;
@@ -364,65 +364,78 @@ fn capture_thread(
                 }
             }
 
-            if let Ok(frame) = frame_pool.TryGetNextFrame() {
-                let content_size = frame.ContentSize().unwrap_or(size);
-                let raw_cw = (content_size.Width as u32).min(width);
-                let raw_ch = (content_size.Height as u32).min(height);
-
-                // If the content grew beyond our current dimensions, restart
-                // the pipeline so ffmpeg gets the right resolution.
-                if raw_cw > content_w || raw_ch > content_h {
-                    log(&format!(
-                        "[snapple] content size grew to {raw_cw}x{raw_ch} (was {content_w}x{content_h}), restarting pipeline"
-                    ));
-                    let _ = frame.Close();
-                    needs_restart = true;
-                    break;
+            // Drain all queued frames, keeping only the most recent.
+            // Only do the expensive GPU→CPU copy for the final frame;
+            // intermediate frames are closed immediately.
+            {
+                let mut latest_frame: Option<windows::Graphics::Capture::Direct3D11CaptureFrame> = None;
+                while let Ok(frame) = frame_pool.TryGetNextFrame() {
+                    if let Some(prev) = latest_frame.take() {
+                        let _ = prev.Close();
+                    }
+                    latest_frame = Some(frame);
                 }
 
-                let src_w = raw_cw.min(content_w) as usize;
-                let src_h = raw_ch.min(content_h) as usize;
+                if let Some(frame) = latest_frame {
+                    let content_size = frame.ContentSize().unwrap_or(size);
+                    let raw_cw = (content_size.Width as u32).min(width);
+                    let raw_ch = (content_size.Height as u32).min(height);
 
-                if let Ok(surface) = frame.Surface() {
-                    if let Ok(dxgi_access) = surface.cast::<IDirect3DDxgiInterfaceAccess>() {
-                        if let Ok(texture) = unsafe { dxgi_access.GetInterface::<ID3D11Texture2D>() } {
-                            unsafe {
-                                d3d_context.CopyResource(&staging, &texture);
+                    // If the content grew beyond our current dimensions, restart
+                    // the pipeline so ffmpeg gets the right resolution.
+                    if raw_cw > content_w || raw_ch > content_h {
+                        log(&format!(
+                            "[snapple] content size grew to {raw_cw}x{raw_ch} (was {content_w}x{content_h}), restarting pipeline"
+                        ));
+                        let _ = frame.Close();
+                        needs_restart = true;
+                        break;
+                    }
 
-                                // Detect GPU device loss (sleep/resume, GPU switch, driver reset).
-                                if let Err(e) = d3d_device.GetDeviceRemovedReason() {
-                                    log(&format!(
-                                        "[snapple] D3D device removed ({:#010x}), stopping capture",
-                                        e.code().0 as u32,
-                                    ));
-                                    let _ = frame.Close();
-                                    running.store(false, Ordering::Relaxed);
-                                    break;
-                                }
+                    let src_w = raw_cw.min(content_w) as usize;
+                    let src_h = raw_ch.min(content_h) as usize;
 
-                                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                                if d3d_context
-                                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                                    .is_ok()
-                                {
-                                    let pitch = mapped.RowPitch as usize;
+                    if let Ok(surface) = frame.Surface() {
+                        if let Ok(dxgi_access) = surface.cast::<IDirect3DDxgiInterfaceAccess>() {
+                            if let Ok(texture) = unsafe { dxgi_access.GetInterface::<ID3D11Texture2D>() } {
+                                unsafe {
+                                    d3d_context.CopyResource(&staging, &texture);
 
-                                    // Downsample directly from the mapped GPU
-                                    // texture into the output-sized frame buffer.
-                                    let src_ptr = mapped.pData as *const u8;
-                                    downsample_bgra(
-                                        src_ptr, src_w, src_h, pitch,
-                                        &mut last_frame, out_w as usize, out_h as usize,
-                                    );
+                                    // Detect GPU device loss (sleep/resume, GPU switch, driver reset).
+                                    if let Err(e) = d3d_device.GetDeviceRemovedReason() {
+                                        log(&format!(
+                                            "[snapple] D3D device removed ({:#010x}), stopping capture",
+                                            e.code().0 as u32,
+                                        ));
+                                        let _ = frame.Close();
+                                        running.store(false, Ordering::Relaxed);
+                                        break;
+                                    }
 
-                                    d3d_context.Unmap(&staging, 0);
-                                    has_first_frame = true;
+                                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                                    if d3d_context
+                                        .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                                        .is_ok()
+                                    {
+                                        let pitch = mapped.RowPitch as usize;
+
+                                        // Downsample directly from the mapped GPU
+                                        // texture into the output-sized frame buffer.
+                                        let src_ptr = mapped.pData as *const u8;
+                                        downsample_bgra(
+                                            src_ptr, src_w, src_h, pitch,
+                                            &mut last_frame, out_w as usize, out_h as usize,
+                                        );
+
+                                        d3d_context.Unmap(&staging, 0);
+                                        has_first_frame = true;
+                                    }
                                 }
                             }
                         }
                     }
+                    let _ = frame.Close();
                 }
-                let _ = frame.Close();
             }
 
             if has_first_frame {
@@ -973,9 +986,8 @@ fn build_ffmpeg_args(
         ]);
     }
 
+    // No -vf scale: input is already pre-scaled by downsample_bgra.
     args.extend([
-        "-vf".into(),
-        cfg.scale.clone(),
         "-pix_fmt".into(),
         "yuv420p".into(),
         "-c:v".into(),
@@ -1092,7 +1104,8 @@ mod tests {
 
         let args = build_ffmpeg_args(2560, 1440, Path::new("C:/temp"), &cfg, None);
 
-        assert!(args.windows(2).any(|w| w == ["-vf", "scale=-2:720"]));
+        // No -vf scale — input is pre-scaled by downsample_bgra.
+        assert!(!args.contains(&"-vf".to_string()));
         assert!(args.windows(2).any(|w| w == ["-r", "60"]));
         assert!(args.windows(2).any(|w| w == ["-s", "2560x1440"]));
     }
