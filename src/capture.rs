@@ -31,6 +31,10 @@ pub struct CaptureSession {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     frame_counter: Arc<AtomicU64>,
+    /// Set to `true` by the capture thread once it enters the frame loop.
+    /// Until then, stall detection is skipped (startup can take >10 s due
+    /// to content-size probing and the audio-pipe handshake).
+    warmup_done: Arc<AtomicBool>,
 }
 
 impl CaptureSession {
@@ -45,6 +49,8 @@ impl CaptureSession {
         let running_clone = running.clone();
         let frame_counter = Arc::new(AtomicU64::new(0));
         let frame_counter_clone = frame_counter.clone();
+        let warmup_done = Arc::new(AtomicBool::new(false));
+        let warmup_done_clone = warmup_done.clone();
 
         let thread = thread::Builder::new()
             .name("capture".into())
@@ -57,6 +63,7 @@ impl CaptureSession {
                     cleanup_age_secs,
                     game_pid,
                     frame_counter_clone,
+                    warmup_done_clone,
                 ) {
                     log(&format!("[snapple] capture error: {e:#}"));
                 }
@@ -67,6 +74,7 @@ impl CaptureSession {
             running,
             thread: Some(thread),
             frame_counter,
+            warmup_done,
         })
     }
 
@@ -89,16 +97,18 @@ impl CaptureSession {
         &self,
         last_frame_count: u64,
         last_check: Instant,
-        start_time: Option<Instant>,
     ) -> bool {
         if !self.is_running() {
             return true;
         }
+        // Don't check for frame stalls while the capture thread is still
+        // warming up (content-size probing + audio-pipe handshake can
+        // take well over 10 seconds).
+        if !self.warmup_done.load(Ordering::Relaxed) {
+            return false;
+        }
         if last_check.elapsed() >= Duration::from_secs(5) {
-            let past_grace = start_time
-                .map(|t| t.elapsed() >= Duration::from_secs(10))
-                .unwrap_or(false);
-            past_grace && self.frame_count() == last_frame_count
+            self.frame_count() == last_frame_count
         } else {
             false
         }
@@ -120,6 +130,7 @@ impl CaptureSession {
             running: Arc::new(AtomicBool::new(true)),
             thread: None,
             frame_counter: Arc::new(AtomicU64::new(0)),
+            warmup_done: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -138,6 +149,7 @@ fn capture_thread(
     cleanup_age_secs: u64,
     game_pid: u32,
     frame_counter: Arc<AtomicU64>,
+    warmup_done: Arc<AtomicBool>,
 ) -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -332,6 +344,7 @@ fn capture_thread(
 
         // --- Frame loop -----------------------------------------------------
         let mut needs_restart = false;
+        warmup_done.store(true, Ordering::Relaxed);
 
         while running.load(Ordering::Relaxed) {
             if last_cleanup.elapsed() > Duration::from_secs(10) {
@@ -1355,48 +1368,45 @@ mod tests {
         session.running.store(false, Ordering::Relaxed);
 
         assert!(
-            session.needs_restart(0, Instant::now(), Some(Instant::now())),
+            session.needs_restart(0, Instant::now()),
             "should restart when the capture thread is no longer running"
         );
     }
 
     #[test]
-    fn no_restart_during_grace_period() {
+    fn no_restart_during_warmup() {
         let session = CaptureSession::dummy();
-        // Frame count stuck at zero, but we're still within the 10s grace period.
-        let start = Instant::now();
-        let old_check = start - Duration::from_secs(6); // >5s ago → eligible for stall check
+        session.warmup_done.store(false, Ordering::Relaxed);
+        // Frame count stuck at zero, but warmup hasn't finished.
+        let old_check = Instant::now() - Duration::from_secs(30);
 
         assert!(
-            !session.needs_restart(0, old_check, Some(start)),
-            "should not restart during the 10-second startup grace period"
+            !session.needs_restart(0, old_check),
+            "should not restart while warmup is still in progress"
         );
     }
 
     #[test]
-    fn restart_on_frame_stall_after_grace() {
+    fn restart_on_frame_stall_after_warmup() {
         let session = CaptureSession::dummy();
-        // Simulate: capture started 15s ago, last check was 6s ago, counter stuck at 100.
-        let start = Instant::now() - Duration::from_secs(15);
+        // warmup_done is true (set by dummy), last check was 6s ago, counter stuck at 100.
         let old_check = Instant::now() - Duration::from_secs(6);
         session.frame_counter.store(100, Ordering::Relaxed);
 
         assert!(
-            session.needs_restart(100, old_check, Some(start)),
-            "should restart when frame count is stuck after grace period"
+            session.needs_restart(100, old_check),
+            "should restart when frame count is stuck after warmup"
         );
     }
 
     #[test]
     fn no_restart_when_frames_advancing() {
         let session = CaptureSession::dummy();
-        // Simulate: capture started 15s ago, last check 6s ago, but counter advanced.
-        let start = Instant::now() - Duration::from_secs(15);
         let old_check = Instant::now() - Duration::from_secs(6);
         session.frame_counter.store(200, Ordering::Relaxed);
 
         assert!(
-            !session.needs_restart(100, old_check, Some(start)),
+            !session.needs_restart(100, old_check),
             "should not restart when frame count is advancing"
         );
     }
@@ -1405,11 +1415,10 @@ mod tests {
     fn no_restart_when_check_interval_not_elapsed() {
         let session = CaptureSession::dummy();
         // Even if counter is stuck, don't check until 5s have passed.
-        let start = Instant::now() - Duration::from_secs(15);
         let recent_check = Instant::now(); // just checked
 
         assert!(
-            !session.needs_restart(0, recent_check, Some(start)),
+            !session.needs_restart(0, recent_check),
             "should not restart before the 5-second check interval"
         );
     }

@@ -171,7 +171,6 @@ fn run() -> Result<()> {
     let mut current_game_pid: Option<u32> = None;
     let mut last_frame_count: u64 = 0;
     let mut last_frame_check = Instant::now();
-    let mut capture_start_time: Option<Instant> = None;
 
     log("[snapple] ready — waiting for a Steam game to launch");
 
@@ -214,7 +213,6 @@ fn run() -> Result<()> {
                             capture_session = Some(session);
                             current_game = Some(name.clone());
                             current_game_pid = Some(pid);
-                            capture_start_time = Some(Instant::now());
                             last_frame_count = 0;
                             last_frame_check = Instant::now();
                             status_item.set_text(format!("Snapple \u{2014} Recording {name}"));
@@ -224,7 +222,6 @@ fn run() -> Result<()> {
                             // Capture failed — don't claim we're recording.
                             current_game = None;
                             current_game_pid = None;
-                            capture_start_time = None;
                             status_item.set_text("Snapple \u{2014} Idle");
                             log(&format!("[snapple] failed to start capture: {e:#}"));
                         }
@@ -237,7 +234,6 @@ fn run() -> Result<()> {
                     }
                     current_game = None;
                     current_game_pid = None;
-                    capture_start_time = None;
                     status_item.set_text("Snapple \u{2014} Idle");
                 }
             }
@@ -296,7 +292,6 @@ fn run() -> Result<()> {
             let restart = session.needs_restart(
                 last_frame_count,
                 last_frame_check,
-                capture_start_time,
             );
             if restart {
                 log("[snapple] capture needs restart (thread exited or frames stalled)");
@@ -330,7 +325,6 @@ fn run() -> Result<()> {
                 ) {
                     Ok(new_session) => {
                         capture_session = Some(new_session);
-                        capture_start_time = Some(Instant::now());
                         last_frame_count = 0;
                         last_frame_check = Instant::now();
                         log(&format!("[snapple] capture restarted for {game_name}"));
@@ -339,7 +333,6 @@ fn run() -> Result<()> {
                         log(&format!("[snapple] failed to restart capture: {e:#}"));
                         current_game = None;
                         current_game_pid = None;
-                        capture_start_time = None;
                         status_item.set_text("Snapple \u{2014} Idle");
                     }
                 }

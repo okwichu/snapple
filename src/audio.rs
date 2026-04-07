@@ -5,7 +5,7 @@ use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use windows::core::{Interface, PCWSTR};
@@ -160,6 +160,25 @@ fn is_float_format(tag: u16, bits: u16) -> bool {
     tag == WAVE_FORMAT_FLOAT || (tag == WAVE_FORMAT_EXTENSIBLE && bits == 32)
 }
 
+/// Log the device ID of the current default render device.
+fn log_default_render_device() -> String {
+    unsafe {
+        let enumerator: std::result::Result<IMMDeviceEnumerator, _> =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL);
+        let Ok(enumerator) = enumerator else {
+            return "(unknown)".into();
+        };
+        let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) else {
+            return "(unknown)".into();
+        };
+        device
+            .GetId()
+            .ok()
+            .and_then(|id| id.to_string().ok())
+            .unwrap_or_else(|| "(unknown)".into())
+    }
+}
+
 /// Open a WASAPI capture source on the default endpoint.
 ///
 /// * `data_flow` — `eRender` for loopback (game audio), `eCapture` for microphone.
@@ -209,11 +228,7 @@ fn open_wasapi_device(device: &IMMDevice, stream_flags: u32) -> Result<WasapiSou
 /// Find the render endpoint that has an active audio session belonging to
 /// `game_pid` and open loopback capture on it.  Falls back to the default
 /// render endpoint if the game's session isn't found.
-///
-/// Currently unused — we always capture the default render device because
-/// PID-based lookup can land on the wrong endpoint (e.g. HDMI output).
-/// Kept for future use if we add silence-detection fallback.
-#[allow(dead_code)]
+#[allow(dead_code)] // kept for future PID-based detection
 fn open_loopback_for_pid(game_pid: u32) -> Result<WasapiSource> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
@@ -387,12 +402,12 @@ fn audio_thread(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    // Always capture from the default render device.  PID-based device
-    // lookup can land on the wrong endpoint (e.g. an HDMI output that
-    // isn't actually carrying audio), producing silence.
+    // Capture from the default render device (loopback).
+    // Log which device we're actually capturing from.
+    let loopback_device_name = log_default_render_device();
     let loopback = open_wasapi(eRender, STREAMFLAGS_LOOPBACK).context("loopback init")?;
     log(&format!(
-        "[snapple] audio loopback: {}Hz {}ch float={}",
+        "[snapple] audio loopback: {}Hz {}ch float={} device={loopback_device_name}",
         loopback.sample_rate, loopback.channels, loopback.is_float
     ));
 
@@ -458,6 +473,7 @@ fn audio_thread(
     // Pre-allocated reusable buffers — avoids per-tick heap allocation.
     let mut lb_raw = Vec::<f32>::new();
     let mut lb_stereo_buf = Vec::<f32>::new();
+    let mut lb_resampled_buf = Vec::<f32>::new();
     let mut mic_raw = Vec::<f32>::new();
     let mut mic_stereo_buf = Vec::<f32>::new();
     let mut mic_resampled_buf = Vec::<f32>::new();
@@ -470,15 +486,48 @@ fn audio_thread(
     let mut values_written: u64 = 0;
     let max_pending_values = target_rate as usize * 2 * MAX_PENDING_AUDIO_MS / 1000;
 
+    // Diagnostic: track peak audio level and report periodically.
+    let mut diag_peak: f32 = 0.0;
+    let mut diag_lb_samples: u64 = 0;
+    let mut diag_last_report = Instant::now();
+
     while running.load(Ordering::Relaxed) {
         // --- loopback ---
         drain_samples_into(&loopback, &mut lb_raw);
-        let lb: &[f32] = if loopback.channels == 2 {
+        let lb_stereo: &[f32] = if loopback.channels == 2 {
             &lb_raw
         } else {
             to_stereo_into(&lb_raw, loopback.channels, &mut lb_stereo_buf);
             &lb_stereo_buf
         };
+        let lb: &[f32] = if loopback.sample_rate != target_rate {
+            resample_stereo_into(lb_stereo, loopback.sample_rate, target_rate, &mut lb_resampled_buf);
+            &lb_resampled_buf
+        } else {
+            lb_stereo
+        };
+
+        // Diagnostic: track loopback audio levels.
+        diag_lb_samples += lb.len() as u64;
+        for &s in lb.iter() {
+            let a = s.abs();
+            if a > diag_peak {
+                diag_peak = a;
+            }
+        }
+        if diag_last_report.elapsed() >= Duration::from_secs(10) {
+            let peak_db = if diag_peak > 0.0 {
+                20.0 * diag_peak.log10()
+            } else {
+                -120.0
+            };
+            log(&format!(
+                "[snapple] audio diag: loopback peak={peak_db:.1}dB samples={diag_lb_samples}"
+            ));
+            diag_peak = 0.0;
+            diag_lb_samples = 0;
+            diag_last_report = Instant::now();
+        }
 
         // --- microphone ---
         let mic_data: &[f32] = if let Some(ref m) = mic {
