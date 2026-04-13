@@ -43,9 +43,10 @@ pub struct CaptureConfig {
     pub monitor: String,
     /// Microphone device: "default" for system default, "none" to disable.
     pub microphone: String,
-    /// Microphone mix volume (0.0–1.0). Low default keeps voice audible
-    /// while preventing game-audio bleed through the mic from causing
-    /// echo and distortion.
+    /// Microphone mix gain (0.0–1.0+). The mixer leaves headroom on the
+    /// loopback side and uses a soft-knee limiter on the sum, so values
+    /// near 1.0 are usable without harsh clipping. Lower this if game
+    /// audio bleeds through the mic and causes echo.
     pub mic_volume: f32,
 }
 
@@ -97,7 +98,7 @@ impl Default for CaptureConfig {
             segment_time: 5,
             monitor: "auto".into(),
             microphone: "default".into(),
-            mic_volume: 0.15,
+            mic_volume: 0.7,
         }
     }
 }

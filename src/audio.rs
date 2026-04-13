@@ -8,13 +8,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows::core::{implement, Interface, Ref, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Pipes::*;
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Variant::VT_BLOB;
 
 use crate::log;
 
@@ -34,6 +36,18 @@ const SHARED_BUFFER_DURATION_100NS: i64 = 10_000_000;
 // audible audio delay when encoding backpressure stalls the video thread,
 // while still absorbing normal scheduling jitter.
 const MAX_PENDING_AUDIO_MS: usize = 150;
+
+// Loopback gain applied during the mix so the sum of game audio + mic has
+// headroom before the soft limiter engages.
+const LOOPBACK_MIX_GAIN: f32 = 0.7;
+
+/// Soft-knee limiter: smoothly compresses values toward ±1.0 instead of the
+/// audible square-wave distortion produced by hard clamping. Identity near
+/// zero, asymptotes to ±1 for large inputs.
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    x / (1.0 + x.abs())
+}
 
 /// Wraps a HANDLE so it can be sent to another thread.
 ///
@@ -225,68 +239,154 @@ fn open_wasapi_device(device: &IMMDevice, stream_flags: u32) -> Result<WasapiSou
     }
 }
 
-/// Find the render endpoint that has an active audio session belonging to
-/// `game_pid` and open loopback capture on it.  Falls back to the default
-/// render endpoint if the game's session isn't found.
-#[allow(dead_code)] // kept for future PID-based detection
-fn open_loopback_for_pid(game_pid: u32) -> Result<WasapiSource> {
+// ---------------------------------------------------------------------------
+// Process loopback (Windows 10 build 20348+)
+// ---------------------------------------------------------------------------
+//
+// `ActivateAudioInterfaceAsync` against the `VAD\Process_Loopback` virtual
+// device gives us a loopback `IAudioClient` that captures whatever the
+// target process tree renders, regardless of which render endpoint Windows
+// is currently routing the game to.  This avoids the entire class of bugs
+// where loopback opens the "wrong" device — e.g. on hybrid laptops when
+// the dGPU sleeps and the set of HDMI/DisplayPort audio endpoints changes
+// while the game is still rendering to a now-stale endpoint.
+//
+// Side effect (almost always desired for game clips): only the target
+// process tree is captured, so Discord, browser audio, and OS sounds no
+// longer leak into clips.
+
+/// Completion handler for `ActivateAudioInterfaceAsync`. The activation is
+/// asynchronous — we hand it this handler and a Win32 event, then block on
+/// the event until `ActivateCompleted` fires and we can call
+/// `GetActivateResult` on the returned operation.
+#[implement(IActivateAudioInterfaceCompletionHandler)]
+struct ActivationHandler {
+    event: HANDLE,
+}
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
+    fn ActivateCompleted(
+        &self,
+        _op: Ref<IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let _ = SetEvent(self.event);
+        }
+        Ok(())
+    }
+}
+
+/// Open a process-loopback capture against `game_pid`'s process tree.
+///
+/// Returns `Err` on Windows builds older than 10.0.20348, when the game's
+/// process can't be activated for loopback (anti-cheat blocks, invalid PID),
+/// or when the activation otherwise fails.  Callers should treat this as a
+/// best-effort path and fall back to default-device loopback.
+fn open_process_loopback(game_pid: u32) -> Result<WasapiSource> {
     unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        // Build the activation parameters describing the target PID and the
+        // include-process-tree mode (so we capture child processes too).
+        let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                    TargetProcessId: game_pid,
+                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                },
+            },
+        };
 
-        // Enumerate all active render endpoints.
-        let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-        let count = devices.GetCount()?;
-
-        for i in 0..count {
-            let device = match devices.Item(i) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            // Get the session manager for this endpoint.
-            let mgr: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let session_enum = match mgr.GetSessionEnumerator() {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let session_count = match session_enum.GetCount() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            for j in 0..session_count {
-                let ctrl = match session_enum.GetSession(j) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let ctrl2: IAudioSessionControl2 = match ctrl.cast() {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let pid = match ctrl2.GetProcessId() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                if pid == game_pid {
-                    let dev_id = device.GetId()?.to_string().unwrap_or_default();
-                    log(&format!(
-                        "[snapple] found game audio session on device {dev_id} (pid {game_pid})"
-                    ));
-                    return open_wasapi_device(&device, STREAMFLAGS_LOOPBACK)
-                        .context("loopback on game device");
-                }
-            }
+        // Wrap the params in a PROPVARIANT of type VT_BLOB.  This packaging
+        // is the documented quirk of `ActivateAudioInterfaceAsync` —
+        // anything else returns E_INVALIDARG.
+        //
+        // ManuallyDrop suppresses `PROPVARIANT::drop` (which calls
+        // `PropVariantClear` → `CoTaskMemFree(pBlobData)`).  Our blob
+        // points at a stack local, not heap, so freeing it would corrupt
+        // the heap.
+        let mut activate_params: core::mem::ManuallyDrop<PROPVARIANT> =
+            core::mem::ManuallyDrop::new(core::mem::zeroed());
+        {
+            let inner = &mut *activate_params.Anonymous.Anonymous;
+            inner.vt = VT_BLOB;
+            inner.Anonymous.blob.cbSize = core::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32;
+            inner.Anonymous.blob.pBlobData = &mut params as *mut _ as *mut u8;
         }
 
-        log(&format!(
-            "[snapple] no audio session found for pid {game_pid}, using default render device"
-        ));
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-        open_wasapi_device(&device, STREAMFLAGS_LOOPBACK)
+        // Manual-reset event signalled by the completion handler.
+        let event = CreateEventW(None, true, false, PCWSTR::null())
+            .context("CreateEventW for activation handler")?;
+
+        let handler: IActivateAudioInterfaceCompletionHandler =
+            ActivationHandler { event }.into();
+
+        let op = ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&*activate_params),
+            &handler,
+        );
+
+        let op = match op {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = CloseHandle(event);
+                return Err(anyhow::anyhow!("ActivateAudioInterfaceAsync: {e}"));
+            }
+        };
+
+        // Wait up to 5 s for the completion handler to fire.
+        let wait = WaitForSingleObject(event, 5000);
+        let _ = CloseHandle(event);
+        if wait != WAIT_OBJECT_0 {
+            anyhow::bail!("activation handler did not complete within 5s");
+        }
+
+        // Pull the activation result back out of the operation.
+        let mut activate_hr = windows::core::HRESULT(0);
+        let mut activated_iface: Option<windows::core::IUnknown> = None;
+        op.GetActivateResult(&mut activate_hr, &mut activated_iface)
+            .context("GetActivateResult")?;
+        activate_hr.ok().context("activation HRESULT")?;
+        let client: IAudioClient = activated_iface
+            .context("activation returned no interface")?
+            .cast()
+            .context("activation interface is not IAudioClient")?;
+
+        // The virtual loopback device has no native mix format — we must
+        // pick one explicitly.  48 kHz / 2 channel / 32-bit float matches
+        // what every modern game renders internally and what the existing
+        // resampler downstream expects.
+        let format = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_FLOAT,
+            nChannels: 2,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 48_000 * 2 * 4,
+            nBlockAlign: 2 * 4,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                STREAMFLAGS_LOOPBACK,
+                SHARED_BUFFER_DURATION_100NS,
+                0,
+                &format,
+                None,
+            )
+            .context("IAudioClient::Initialize for process loopback")?;
+
+        let capture: IAudioCaptureClient = client.GetService().context("GetService")?;
+
+        Ok(WasapiSource {
+            client,
+            capture,
+            sample_rate: 48_000,
+            channels: 2,
+            is_float: true,
+        })
     }
 }
 
@@ -389,7 +489,7 @@ fn audio_thread(
     pipe: SendableHandle,
     mic_device: &str,
     mic_volume: f32,
-    _game_pid: u32,
+    game_pid: u32,
     target_rate: u32,
     running: &AtomicBool,
     video_frames: &AtomicU64,
@@ -402,14 +502,32 @@ fn audio_thread(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    // Capture from the default render device (loopback).
-    // Log which device we're actually capturing from.
-    let loopback_device_name = log_default_render_device();
-    let loopback = open_wasapi(eRender, STREAMFLAGS_LOOPBACK).context("loopback init")?;
-    log(&format!(
-        "[snapple] audio loopback: {}Hz {}ch float={} device={loopback_device_name}",
-        loopback.sample_rate, loopback.channels, loopback.is_float
-    ));
+    // Prefer process loopback so we follow the game's audio regardless of
+    // which render endpoint Windows happens to be routing it to.  Falls
+    // back to default-device loopback on older Windows builds or if
+    // activation fails for any reason (anti-cheat, permissions, etc.).
+    let loopback = match open_process_loopback(game_pid) {
+        Ok(lb) => {
+            log(&format!(
+                "[snapple] audio loopback: process pid={game_pid} {}Hz {}ch float={}",
+                lb.sample_rate, lb.channels, lb.is_float
+            ));
+            lb
+        }
+        Err(e) => {
+            log(&format!(
+                "[snapple] process loopback unavailable ({e:#}), falling back to default device"
+            ));
+            let loopback_device_name = log_default_render_device();
+            let lb =
+                open_wasapi(eRender, STREAMFLAGS_LOOPBACK).context("loopback init (fallback)")?;
+            log(&format!(
+                "[snapple] audio loopback (fallback): {}Hz {}ch float={} device={loopback_device_name}",
+                lb.sample_rate, lb.channels, lb.is_float
+            ));
+            lb
+        }
+    };
 
     let mic = if mic_device != "none" {
         match open_wasapi(eCapture, 0) {
@@ -553,6 +671,10 @@ fn audio_thread(
         // samples are appended.  Mic samples beyond the loopback length are
         // discarded; splicing them in would insert discontinuities into the
         // game audio waveform, causing a gritty buzz.
+        //
+        // Game audio is attenuated to leave headroom for the mic, then the
+        // sum is run through soft_clip so loud peaks compress smoothly
+        // instead of producing the harsh distortion of a hard clamp.
         let len = lb.len();
         if len > 0 {
             let base = pending.len();
@@ -560,10 +682,11 @@ fn audio_thread(
 
             let overlap = len.min(mic_data.len());
             for i in 0..overlap {
-                pending[base + i] = (lb[i] + mic_data[i] * mic_volume).clamp(-1.0, 1.0);
+                let mixed = lb[i] * LOOPBACK_MIX_GAIN + mic_data[i] * mic_volume;
+                pending[base + i] = soft_clip(mixed);
             }
             for i in overlap..len {
-                pending[base + i] = lb[i];
+                pending[base + i] = soft_clip(lb[i] * LOOPBACK_MIX_GAIN);
             }
         }
 
@@ -614,7 +737,63 @@ fn audio_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{resample_stereo_into, to_stereo_into, MAX_PENDING_AUDIO_MS};
+    use super::{open_process_loopback, resample_stereo_into, soft_clip, to_stereo_into, MAX_PENDING_AUDIO_MS};
+
+    // -----------------------------------------------------------------------
+    // Process loopback failure handling: an obviously-invalid PID must
+    // return Err rather than panic, so the audio thread's fallback path
+    // engages cleanly.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn process_loopback_invalid_pid_returns_err() {
+        // PID 0 is the System Idle Process — activation should never
+        // succeed against it, but it also must not panic.  On Windows
+        // builds older than 10.0.20348 the call fails earlier with
+        // "API not available" — also fine, also Err.
+        let result = open_process_loopback(0);
+        assert!(
+            result.is_err(),
+            "open_process_loopback(0) unexpectedly succeeded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // soft_clip: guards against accidental regression to a hard clamp, which
+    // produced the audible square-wave distortion that motivated the fix.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn soft_clip_is_near_identity_for_small_inputs() {
+        // For quiet signals the limiter should be effectively transparent.
+        for &x in &[-0.1f32, -0.01, 0.0, 0.01, 0.1] {
+            let y = soft_clip(x);
+            assert!((y - x).abs() < 0.02, "soft_clip({x}) = {y}, expected ~{x}");
+        }
+    }
+
+    #[test]
+    fn soft_clip_is_strictly_bounded_below_unity() {
+        // No finite input should ever escape (-1, 1) — that's the whole
+        // point of replacing the hard clamp.
+        for &x in &[-1000.0f32, -10.0, -1.0, 1.0, 10.0, 1000.0] {
+            let y = soft_clip(x);
+            assert!(y.abs() < 1.0, "soft_clip({x}) = {y}, must be < 1.0 in magnitude");
+        }
+    }
+
+    #[test]
+    fn soft_clip_is_monotonic() {
+        // A limiter that isn't monotonic would scramble waveform shape.
+        let mut prev = soft_clip(-5.0);
+        let mut x = -5.0f32;
+        while x < 5.0 {
+            x += 0.05;
+            let y = soft_clip(x);
+            assert!(y >= prev, "soft_clip not monotonic at x={x}: {prev} -> {y}");
+            prev = y;
+        }
+    }
 
     fn allowed_values(video_frames: u64, sample_rate: u32, fps: u64, values_written: u64) -> u64 {
         let target_samples = video_frames * sample_rate as u64 / fps;

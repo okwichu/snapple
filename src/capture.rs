@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use windows::core::Interface;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -342,6 +343,15 @@ fn capture_thread(
         let mut frame_count: u64 = 0;
         let mut pacing_origin: Option<Instant> = None;
 
+        // Cached downsample LUT — rebuilt only when source/dest dims change.
+        let mut downsample_lut: Option<DownsampleLut> = None;
+
+        // Per-second capture diagnostics.
+        let mut diag_downsample_total = Duration::ZERO;
+        let mut diag_unique_frames: u64 = 0;
+        let mut diag_dup_writes: u64 = 0;
+        let mut diag_last_report = Instant::now();
+
         // --- Frame loop -----------------------------------------------------
         let mut needs_restart = false;
         warmup_done.store(true, Ordering::Relaxed);
@@ -418,14 +428,27 @@ fn capture_thread(
                                         .is_ok()
                                     {
                                         let pitch = mapped.RowPitch as usize;
+                                        let dst_w = out_w as usize;
+                                        let dst_h = out_h as usize;
+
+                                        // Build (or rebuild) the LUT if geometry changed.
+                                        let needs_rebuild = downsample_lut
+                                            .as_ref()
+                                            .is_none_or(|l| !l.matches(src_w, src_h, dst_w, dst_h));
+                                        if needs_rebuild {
+                                            downsample_lut = Some(
+                                                DownsampleLut::new(src_w, src_h, dst_w, dst_h),
+                                            );
+                                        }
+                                        let lut = downsample_lut.as_ref().unwrap();
 
                                         // Downsample directly from the mapped GPU
                                         // texture into the output-sized frame buffer.
                                         let src_ptr = mapped.pData as *const u8;
-                                        downsample_bgra(
-                                            src_ptr, src_w, src_h, pitch,
-                                            &mut last_frame, out_w as usize, out_h as usize,
-                                        );
+                                        let downsample_start = Instant::now();
+                                        downsample_bgra(src_ptr, pitch, &mut last_frame, lut);
+                                        diag_downsample_total += downsample_start.elapsed();
+                                        diag_unique_frames += 1;
 
                                         d3d_context.Unmap(&staging, 0);
                                         has_first_frame = true;
@@ -459,6 +482,25 @@ fn capture_thread(
                     video_frames.fetch_add(1, Ordering::Relaxed);
                     frame_counter.fetch_add(1, Ordering::Relaxed);
                     frame_count += 1;
+                }
+                // Everything past the first write in this iteration is a
+                // duplicate of `last_frame` injected to keep wall-clock pace.
+                diag_dup_writes += writes.saturating_sub(1);
+
+                if diag_last_report.elapsed() >= Duration::from_secs(1) {
+                    let avg_ms = if diag_unique_frames > 0 {
+                        diag_downsample_total.as_secs_f64() * 1000.0
+                            / diag_unique_frames as f64
+                    } else {
+                        0.0
+                    };
+                    log(&format!(
+                        "[snapple] capture diag: avg downsample={avg_ms:.1}ms unique={diag_unique_frames} dup={diag_dup_writes}"
+                    ));
+                    diag_downsample_total = Duration::ZERO;
+                    diag_unique_frames = 0;
+                    diag_dup_writes = 0;
+                    diag_last_report = Instant::now();
                 }
 
                 let next_due_us = frame_count * 1_000_000 / fps;
@@ -814,34 +856,79 @@ fn compute_output_dims(scale: &str, src_w: u32, src_h: u32) -> (u32, u32) {
     (src_w, src_h)
 }
 
-/// Nearest-neighbour downsample of a BGRA image.  Reads directly from a
-/// mapped GPU staging texture (with arbitrary row pitch) and writes into a
-/// tightly-packed output buffer.
-///
-/// # Safety
-/// `src` must point to at least `src_pitch * src_h` readable bytes.
-unsafe fn downsample_bgra(
-    src: *const u8,
+/// Precomputed nearest-neighbour source-index lookup tables for one
+/// downsample geometry. Built once per (src_w, src_h, dst_w, dst_h) tuple
+/// and reused for every frame, so the inner downsample loop becomes a
+/// straight array load + 4-byte copy with no per-pixel divisions.
+struct DownsampleLut {
     src_w: usize,
     src_h: usize,
-    src_pitch: usize,
-    dst: &mut [u8],
     dst_w: usize,
     dst_h: usize,
-) {
-    unsafe {
-        for dy in 0..dst_h {
-            let sy = dy * src_h / dst_h;
-            let src_row = src.add(sy * src_pitch);
-            let dst_off = dy * dst_w * 4;
-            for dx in 0..dst_w {
-                let sx = dx * src_w / dst_w;
-                let si = sx * 4;
-                let di = dst_off + dx * 4;
-                std::ptr::copy_nonoverlapping(src_row.add(si), dst[di..].as_mut_ptr(), 4);
-            }
-        }
+    /// `sx_bytes[dx]` = byte offset within a source row for output column `dx`.
+    sx_bytes: Vec<usize>,
+    /// `sy_rows[dy]` = source row index for output row `dy`.
+    sy_rows: Vec<usize>,
+}
+
+impl DownsampleLut {
+    fn new(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Self {
+        let sx_bytes = (0..dst_w).map(|dx| (dx * src_w / dst_w) * 4).collect();
+        let sy_rows = (0..dst_h).map(|dy| dy * src_h / dst_h).collect();
+        Self { src_w, src_h, dst_w, dst_h, sx_bytes, sy_rows }
     }
+
+    fn matches(&self, src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> bool {
+        self.src_w == src_w && self.src_h == src_h
+            && self.dst_w == dst_w && self.dst_h == dst_h
+    }
+}
+
+/// Wraps a mapped-texture pointer so it can be shared across rayon workers.
+/// The downsample only ever reads through this pointer, and the row LUT
+/// guarantees each worker touches a disjoint set of source bytes.
+#[derive(Copy, Clone)]
+struct SrcPtr(*const u8);
+unsafe impl Send for SrcPtr {}
+unsafe impl Sync for SrcPtr {}
+
+impl SrcPtr {
+    /// Method accessor so closures capture the whole `SrcPtr` (which is
+    /// `Sync`) instead of the bare `*const u8` field via disjoint captures.
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        self.0
+    }
+}
+
+/// Nearest-neighbour downsample of a BGRA image.  Reads directly from a
+/// mapped GPU staging texture (with arbitrary row pitch) and writes into a
+/// tightly-packed output buffer in parallel across rows.
+///
+/// # Safety
+/// `src` must point to at least `src_pitch * lut.src_h` readable bytes and
+/// remain valid for the duration of the call.
+unsafe fn downsample_bgra(src: *const u8, src_pitch: usize, dst: &mut [u8], lut: &DownsampleLut) {
+    let dst_w = lut.dst_w;
+    let dst_row_bytes = dst_w * 4;
+    let src_ptr = SrcPtr(src);
+    let sx_bytes = &lut.sx_bytes;
+    let sy_rows = &lut.sy_rows;
+
+    dst.par_chunks_mut(dst_row_bytes)
+        .enumerate()
+        .for_each(|(dy, dst_row)| {
+            let src_row = unsafe { src_ptr.as_ptr().add(sy_rows[dy] * src_pitch) };
+            for dx in 0..dst_w {
+                let si = sx_bytes[dx];
+                let di = dx * 4;
+                // BGRA pixel is exactly 4 bytes — copy as a single u32 load/store.
+                let pixel = unsafe { (src_row.add(si) as *const u32).read_unaligned() };
+                unsafe {
+                    (dst_row.as_mut_ptr().add(di) as *mut u32).write_unaligned(pixel);
+                }
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,7 +1161,7 @@ fn drain_ffmpeg_stderr(child: &mut Child) {
 mod tests {
     use super::{
         build_ffmpeg_args, choose_monitor_target, compute_output_dims, downsample_bgra,
-        frame_interval, AudioInput, CaptureSession,
+        frame_interval, AudioInput, CaptureSession, DownsampleLut,
     };
     use crate::config::CaptureConfig;
     use std::path::Path;
@@ -1251,11 +1338,9 @@ mod tests {
         let dst_h: usize = 40;
         let mut dst = vec![0u8; dst_w * dst_h * 4];
 
+        let lut = DownsampleLut::new(src_w, src_h, dst_w, dst_h);
         unsafe {
-            downsample_bgra(
-                src.as_ptr(), src_w, src_h, src_pitch,
-                &mut dst, dst_w, dst_h,
-            );
+            downsample_bgra(src.as_ptr(), src_pitch, &mut dst, &lut);
         }
 
         // Every pixel in the output must be non-zero — any zeros would
@@ -1289,11 +1374,9 @@ mod tests {
         let dst_h: usize = 25;
         let mut dst = vec![0u8; dst_w * dst_h * 4];
 
+        let lut = DownsampleLut::new(src_w, src_h, dst_w, dst_h);
         unsafe {
-            downsample_bgra(
-                src.as_ptr(), src_w, src_h, src_pitch,
-                &mut dst, dst_w, dst_h,
-            );
+            downsample_bgra(src.as_ptr(), src_pitch, &mut dst, &lut);
         }
 
         for (i, chunk) in dst.chunks(4).enumerate() {
@@ -1305,6 +1388,90 @@ mod tests {
                 "wrong pixel at output ({x}, {y}) — pitch handling is broken"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LUT-vs-naive equivalence: the LUT path must produce byte-identical
+    // output to the original `dx*src_w/dst_w` formula. Catches off-by-one
+    // bugs in the LUT builder.
+    // -----------------------------------------------------------------------
+
+    fn naive_downsample(
+        src: &[u8],
+        src_w: usize,
+        src_h: usize,
+        src_pitch: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> Vec<u8> {
+        let mut dst = vec![0u8; dst_w * dst_h * 4];
+        for dy in 0..dst_h {
+            let sy = dy * src_h / dst_h;
+            for dx in 0..dst_w {
+                let sx = dx * src_w / dst_w;
+                let si = sy * src_pitch + sx * 4;
+                let di = (dy * dst_w + dx) * 4;
+                dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+        dst
+    }
+
+    #[test]
+    fn lut_downsample_matches_naive_formula() {
+        // Use a non-trivial source so any off-by-one in sx/sy LUTs visibly
+        // mismatches: each pixel's BGRA encodes (x, y, x^y, 0xFF).
+        let cases = [
+            (200usize, 100usize, 80usize, 40usize),
+            (3840, 2160, 1280, 720),
+            (2560, 1440, 1280, 720),
+            (1920, 1080, 854, 480),
+            (100, 50, 50, 25),
+        ];
+
+        for (src_w, src_h, dst_w, dst_h) in cases {
+            // Use a pitch deliberately larger than src_w*4 to mimic GPU staging.
+            let src_pitch = (src_w * 4 + 255) & !255;
+            let mut src = vec![0u8; src_pitch * src_h];
+            for y in 0..src_h {
+                for x in 0..src_w {
+                    let off = y * src_pitch + x * 4;
+                    src[off] = x as u8;
+                    src[off + 1] = y as u8;
+                    src[off + 2] = (x ^ y) as u8;
+                    src[off + 3] = 0xFF;
+                }
+            }
+
+            let expected = naive_downsample(&src, src_w, src_h, src_pitch, dst_w, dst_h);
+
+            let lut = DownsampleLut::new(src_w, src_h, dst_w, dst_h);
+            let mut actual = vec![0u8; dst_w * dst_h * 4];
+            unsafe {
+                downsample_bgra(src.as_ptr(), src_pitch, &mut actual, &lut);
+            }
+
+            assert_eq!(
+                actual, expected,
+                "LUT downsample diverges from naive at {src_w}x{src_h} -> {dst_w}x{dst_h}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mic default audibility: the original 0.15 default made the mic
+    // inaudible against game audio. Pin a sane floor so a future "tidy
+    // the defaults" pass can't silently regress it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_mic_volume_is_audible() {
+        let cfg = CaptureConfig::default();
+        assert!(
+            cfg.mic_volume >= 0.5,
+            "mic_volume default ({}) is too low — voice will be drowned out by game audio",
+            cfg.mic_volume
+        );
     }
 
     // -----------------------------------------------------------------------
