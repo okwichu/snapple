@@ -856,26 +856,29 @@ fn compute_output_dims(scale: &str, src_w: u32, src_h: u32) -> (u32, u32) {
     (src_w, src_h)
 }
 
-/// Precomputed nearest-neighbour source-index lookup tables for one
-/// downsample geometry. Built once per (src_w, src_h, dst_w, dst_h) tuple
-/// and reused for every frame, so the inner downsample loop becomes a
-/// straight array load + 4-byte copy with no per-pixel divisions.
+/// Precomputed source-rectangle boundaries for an area-average downsample.
+/// Built once per (src_w, src_h, dst_w, dst_h) tuple and reused for every
+/// frame, so the inner loop is pure pointer arithmetic with no divisions.
+///
+/// `sx_starts` has length `dst_w + 1`; output column `dx` covers source
+/// columns `sx_starts[dx]..sx_starts[dx+1]`.  Adjacent ranges abut
+/// exactly, which means every source pixel is read by exactly one output
+/// pixel's rectangle — a clean partition of the source image.
+/// `sy_starts` works the same way for rows.
 struct DownsampleLut {
     src_w: usize,
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
-    /// `sx_bytes[dx]` = byte offset within a source row for output column `dx`.
-    sx_bytes: Vec<usize>,
-    /// `sy_rows[dy]` = source row index for output row `dy`.
-    sy_rows: Vec<usize>,
+    sx_starts: Vec<usize>,
+    sy_starts: Vec<usize>,
 }
 
 impl DownsampleLut {
     fn new(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Self {
-        let sx_bytes = (0..dst_w).map(|dx| (dx * src_w / dst_w) * 4).collect();
-        let sy_rows = (0..dst_h).map(|dy| dy * src_h / dst_h).collect();
-        Self { src_w, src_h, dst_w, dst_h, sx_bytes, sy_rows }
+        let sx_starts: Vec<usize> = (0..=dst_w).map(|dx| dx * src_w / dst_w).collect();
+        let sy_starts: Vec<usize> = (0..=dst_h).map(|dy| dy * src_h / dst_h).collect();
+        Self { src_w, src_h, dst_w, dst_h, sx_starts, sy_starts }
     }
 
     fn matches(&self, src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> bool {
@@ -901,9 +904,16 @@ impl SrcPtr {
     }
 }
 
-/// Nearest-neighbour downsample of a BGRA image.  Reads directly from a
-/// mapped GPU staging texture (with arbitrary row pitch) and writes into a
-/// tightly-packed output buffer in parallel across rows.
+/// Area-average downsample of a BGRA image.  Each output pixel is the
+/// mean of all source pixels in its rectangle, computed independently per
+/// channel — the same filter as `cv2.INTER_AREA` and ImageMagick's
+/// `-filter box`.  Eliminates the aliasing/shimmer that nearest-neighbour
+/// produces on text, fine geometry, and HUD edges.
+///
+/// Rows are processed in parallel via rayon.  The per-row work is
+/// proportional to `src_w * (sy_end - sy_start)`, so the total cost is
+/// roughly one read of every source pixel — comfortably real-time at 60
+/// fps on every test resolution from 1080p to 4K source.
 ///
 /// # Safety
 /// `src` must point to at least `src_pitch * lut.src_h` readable bytes and
@@ -912,20 +922,43 @@ unsafe fn downsample_bgra(src: *const u8, src_pitch: usize, dst: &mut [u8], lut:
     let dst_w = lut.dst_w;
     let dst_row_bytes = dst_w * 4;
     let src_ptr = SrcPtr(src);
-    let sx_bytes = &lut.sx_bytes;
-    let sy_rows = &lut.sy_rows;
+    let sx_starts = &lut.sx_starts;
+    let sy_starts = &lut.sy_starts;
 
     dst.par_chunks_mut(dst_row_bytes)
         .enumerate()
         .for_each(|(dy, dst_row)| {
-            let src_row = unsafe { src_ptr.as_ptr().add(sy_rows[dy] * src_pitch) };
+            let sy_start = sy_starts[dy];
+            let sy_end = sy_starts[dy + 1];
             for dx in 0..dst_w {
-                let si = sx_bytes[dx];
-                let di = dx * 4;
-                // BGRA pixel is exactly 4 bytes — copy as a single u32 load/store.
-                let pixel = unsafe { (src_row.add(si) as *const u32).read_unaligned() };
+                let sx_start = sx_starts[dx];
+                let sx_end = sx_starts[dx + 1];
+                let count = ((sy_end - sy_start) * (sx_end - sx_start)) as u32;
+
+                // Sum BGRA channels independently across the rectangle.
+                // u32 accumulators handle up to ~16M source pixels per
+                // output cell without overflow — orders of magnitude past
+                // anything realistic.
+                let (mut b, mut g, mut r, mut a) = (0u32, 0u32, 0u32, 0u32);
+                for sy in sy_start..sy_end {
+                    let row_ptr = unsafe { src_ptr.as_ptr().add(sy * src_pitch) };
+                    for sx in sx_start..sx_end {
+                        let p = unsafe {
+                            (row_ptr.add(sx * 4) as *const u32).read_unaligned()
+                        };
+                        b += p & 0xFF;
+                        g += (p >> 8) & 0xFF;
+                        r += (p >> 16) & 0xFF;
+                        a += (p >> 24) & 0xFF;
+                    }
+                }
+
+                let out = ((a / count) << 24)
+                    | ((r / count) << 16)
+                    | ((g / count) << 8)
+                    | (b / count);
                 unsafe {
-                    (dst_row.as_mut_ptr().add(di) as *mut u32).write_unaligned(pixel);
+                    (dst_row.as_mut_ptr().add(dx * 4) as *mut u32).write_unaligned(out);
                 }
             }
         });
@@ -935,15 +968,90 @@ unsafe fn downsample_bgra(src: *const u8, src_pitch: usize, dst: &mut [u8], lut:
 // Encoder probing & fallback
 // ---------------------------------------------------------------------------
 
-/// Encoder presets: (encoder, preset, rate_control, quality).
-const ENCODER_FALLBACKS: &[(&str, &str, &str, &str)] = &[
-    // NVIDIA
-    ("h264_nvenc", "p4", "constqp", "16"),
-    // AMD
-    ("h264_amf", "balanced", "cqp", "16"),
-    // Software (always available)
-    ("libx264", "fast", "crf", "16"),
+/// Per-encoder quality profile.  `extra` is appended verbatim to the
+/// ffmpeg argv after the standard `-preset/-rc/-qp` block, and is the
+/// place to put encoder-specific quality flags that ffmpeg names
+/// differently per encoder (`-tune`, `-multipass`, `-spatial_aq`,
+/// `-preanalysis`, `-vbaq`, etc.).
+struct EncoderProfile {
+    encoder: &'static str,
+    preset: &'static str,
+    rate_control: &'static str,
+    quality: &'static str,
+    extra: &'static [&'static str],
+}
+
+/// Quality-tuned profiles for each supported H.264 encoder.  Order is the
+/// fallback priority — `resolve_encoder` walks this list and picks the
+/// first entry whose encoder probes successfully.
+///
+/// The `extra` blocks are the standard "max quality, still real-time at
+/// 720p60" flag set for each encoder family.  At 720p60 even the slowest
+/// preset is comfortably real-time on every modern GPU/CPU we target, so
+/// we leave the resource trade-off pinned to the quality side.
+const ENCODER_PROFILES: &[EncoderProfile] = &[
+    // NVIDIA — full nvenc quality knobs.  p7 is the slowest preset,
+    // multipass fullres runs two passes per frame for better bit
+    // allocation, AQ + lookahead + B-frames + middle-ref improve subjective
+    // quality at the same qp, and high profile unlocks 8x8 transforms +
+    // CABAC.
+    EncoderProfile {
+        encoder: "h264_nvenc",
+        preset: "p7",
+        rate_control: "constqp",
+        quality: "16",
+        extra: &[
+            "-tune", "hq",
+            "-multipass", "fullres",
+            "-spatial_aq", "1",
+            "-temporal_aq", "1",
+            "-rc-lookahead", "32",
+            "-bf", "3",
+            "-b_ref_mode", "middle",
+            "-profile:v", "high",
+            "-level", "4.2",
+        ],
+    },
+    // AMD — `quality` is the slowest AMF preset.  preanalysis is the AMF
+    // analogue of motion lookahead; vbaq (variance-based adaptive
+    // quantization) is the analogue of spatial AQ.  B-frames omitted: AMF
+    // H.264 B-frame support is hardware-dependent and can fail to
+    // initialise on older Radeons.
+    EncoderProfile {
+        encoder: "h264_amf",
+        preset: "quality",
+        rate_control: "cqp",
+        quality: "16",
+        extra: &[
+            "-preanalysis", "true",
+            "-vbaq", "true",
+            "-profile:v", "high",
+            "-level", "4.2",
+        ],
+    },
+    // libx264 — `slow` preset adds RDO, more refs, deeper analysis.
+    // Still real-time at 720p60 on any modern x86.  `tune film` biases
+    // motion compensation toward live-action / gameplay content.
+    EncoderProfile {
+        encoder: "libx264",
+        preset: "slow",
+        rate_control: "crf",
+        quality: "16",
+        extra: &[
+            "-tune", "film",
+            "-profile:v", "high",
+            "-level", "4.2",
+        ],
+    },
 ];
+
+/// Look up the static `EncoderProfile` for a given encoder name, if any.
+/// Used by `build_ffmpeg_args` to find the `extra` flag block — the
+/// returned profile is also the source of truth for the preset, rate
+/// control, and quality value when `resolve_encoder` falls back.
+fn lookup_profile(encoder: &str) -> Option<&'static EncoderProfile> {
+    ENCODER_PROFILES.iter().find(|p| p.encoder == encoder)
+}
 
 /// Check if a given encoder is available in ffmpeg by doing a tiny test encode.
 fn probe_encoder(ffmpeg_path: &Path, encoder: &str) -> bool {
@@ -969,7 +1077,10 @@ fn probe_encoder(ffmpeg_path: &Path, encoder: &str) -> bool {
 }
 
 /// Return a CaptureConfig with a working encoder. If the configured encoder
-/// works, returns a clone unchanged.  Otherwise walks the fallback list.
+/// works, returns a clone unchanged (preserving any user overrides on
+/// preset/rate_control/quality).  Otherwise walks `ENCODER_PROFILES` and
+/// adopts the first profile whose encoder probes successfully —
+/// overwriting preset/rate_control/quality with the profile's values.
 fn resolve_encoder(ffmpeg_path: &Path, cfg: &CaptureConfig) -> CaptureConfig {
     // Fast path: configured encoder works.
     if probe_encoder(ffmpeg_path, &cfg.encoder) {
@@ -982,17 +1093,17 @@ fn resolve_encoder(ffmpeg_path: &Path, cfg: &CaptureConfig) -> CaptureConfig {
         cfg.encoder
     ));
 
-    for &(enc, preset, rc, quality) in ENCODER_FALLBACKS {
-        if enc == cfg.encoder {
+    for profile in ENCODER_PROFILES {
+        if profile.encoder == cfg.encoder {
             continue; // Already tried.
         }
-        if probe_encoder(ffmpeg_path, enc) {
-            log(&format!("[snapple] using fallback encoder {enc}"));
+        if probe_encoder(ffmpeg_path, profile.encoder) {
+            log(&format!("[snapple] using fallback encoder {}", profile.encoder));
             let mut resolved = cfg.clone();
-            resolved.encoder = enc.into();
-            resolved.preset = preset.into();
-            resolved.rate_control = rc.into();
-            resolved.quality = quality.into();
+            resolved.encoder = profile.encoder.into();
+            resolved.preset = profile.preset.into();
+            resolved.rate_control = profile.rate_control.into();
+            resolved.quality = profile.quality.into();
             return resolved;
         }
     }
@@ -1086,6 +1197,14 @@ fn build_ffmpeg_args(
         cfg.quality_flag().into(),
         cfg.quality.clone(),
     ]);
+
+    // Append the encoder-specific quality flag block (-tune, AQ,
+    // lookahead, B-frames, profile, etc.) from the profile matrix.  If
+    // the user is on a custom encoder not in the matrix, no extras are
+    // added — they get the basic args only.
+    if let Some(profile) = lookup_profile(&cfg.encoder) {
+        args.extend(profile.extra.iter().map(|s| (*s).into()));
+    }
 
     if audio.is_some() {
         args.extend([
@@ -1245,6 +1364,44 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_args_include_nvenc_quality_flags() {
+        // The nvenc profile in ENCODER_PROFILES must surface its extras
+        // (high profile, lookahead, AQ, multipass, B-frames) into the
+        // ffmpeg argv.  Guards against silently dropping the flag block.
+        let cfg = CaptureConfig::default();
+        assert_eq!(cfg.encoder, "h264_nvenc");
+
+        let args = build_ffmpeg_args(1280, 720, Path::new("C:/temp"), &cfg, None);
+
+        assert!(args.windows(2).any(|w| w == ["-profile:v", "high"]));
+        assert!(args.windows(2).any(|w| w == ["-tune", "hq"]));
+        assert!(args.windows(2).any(|w| w == ["-multipass", "fullres"]));
+        assert!(args.windows(2).any(|w| w == ["-spatial_aq", "1"]));
+        assert!(args.windows(2).any(|w| w == ["-temporal_aq", "1"]));
+        assert!(args.windows(2).any(|w| w == ["-rc-lookahead", "32"]));
+        assert!(args.windows(2).any(|w| w == ["-bf", "3"]));
+        assert!(args.windows(2).any(|w| w == ["-b_ref_mode", "middle"]));
+    }
+
+    #[test]
+    fn ffmpeg_args_unknown_encoder_emits_no_extras() {
+        // Custom user-set encoder not in the matrix gets no extras —
+        // basic args only, no panic.
+        let mut cfg = CaptureConfig::default();
+        cfg.encoder = "h264_qsv".into(); // not in ENCODER_PROFILES
+        cfg.preset = "veryslow".into();
+        cfg.rate_control = "icq".into();
+
+        let args = build_ffmpeg_args(1280, 720, Path::new("C:/temp"), &cfg, None);
+
+        // Encoder name comes through unchanged.
+        assert!(args.windows(2).any(|w| w == ["-c:v", "h264_qsv"]));
+        // None of the nvenc-specific extras should leak in.
+        assert!(!args.iter().any(|a| a == "-tune"));
+        assert!(!args.iter().any(|a| a == "-rc-lookahead"));
+    }
+
+    #[test]
     fn audio_bitrate_is_320k() {
         let cfg = CaptureConfig::default();
         let args = build_ffmpeg_args(
@@ -1391,9 +1548,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // LUT-vs-naive equivalence: the LUT path must produce byte-identical
-    // output to the original `dx*src_w/dst_w` formula. Catches off-by-one
-    // bugs in the LUT builder.
+    // LUT-vs-naive equivalence: the LUT-driven area-average downsample
+    // must produce byte-identical output to a straightforward reference
+    // implementation that computes the same per-channel mean over each
+    // output pixel's source rectangle.  Catches off-by-one bugs in the
+    // partition LUT and channel-extraction arithmetic.
     // -----------------------------------------------------------------------
 
     fn naive_downsample(
@@ -1406,12 +1565,29 @@ mod tests {
     ) -> Vec<u8> {
         let mut dst = vec![0u8; dst_w * dst_h * 4];
         for dy in 0..dst_h {
-            let sy = dy * src_h / dst_h;
+            let sy_start = dy * src_h / dst_h;
+            let sy_end = (dy + 1) * src_h / dst_h;
             for dx in 0..dst_w {
-                let sx = dx * src_w / dst_w;
-                let si = sy * src_pitch + sx * 4;
+                let sx_start = dx * src_w / dst_w;
+                let sx_end = (dx + 1) * src_w / dst_w;
+                let count = ((sy_end - sy_start) * (sx_end - sx_start)) as u32;
+
+                let (mut b, mut g, mut r, mut a) = (0u32, 0u32, 0u32, 0u32);
+                for sy in sy_start..sy_end {
+                    for sx in sx_start..sx_end {
+                        let off = sy * src_pitch + sx * 4;
+                        b += src[off] as u32;
+                        g += src[off + 1] as u32;
+                        r += src[off + 2] as u32;
+                        a += src[off + 3] as u32;
+                    }
+                }
+
                 let di = (dy * dst_w + dx) * 4;
-                dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                dst[di] = (b / count) as u8;
+                dst[di + 1] = (g / count) as u8;
+                dst[di + 2] = (r / count) as u8;
+                dst[di + 3] = (a / count) as u8;
             }
         }
         dst

@@ -88,11 +88,16 @@ fn default_extra_games() -> Vec<ExtraGame> {
 
 impl Default for CaptureConfig {
     fn default() -> Self {
+        // preset/rate_control/quality reflect the h264_nvenc entry in
+        // capture.rs::ENCODER_PROFILES.  The matrix supplies the
+        // additional quality flags (-tune, AQ, lookahead, B-frames,
+        // profile, level) — these three fields stay user-overridable
+        // through snapple.toml.
         Self {
             fps: 60,
             scale: "scale=-2:720".into(),
             encoder: "h264_nvenc".into(),
-            preset: "p4".into(),
+            preset: "p7".into(),
             rate_control: "constqp".into(),
             quality: "16".into(),
             segment_time: 5,
