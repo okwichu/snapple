@@ -170,6 +170,7 @@ fn run() -> Result<()> {
     let cleanup_age = cfg.cleanup_age_secs();
     let mut current_game_pid: Option<u32> = None;
     let mut last_frame_count: u64 = 0;
+    let mut last_unique_count: u64 = 0;
     let mut last_frame_check = Instant::now();
 
     log("[snapple] ready — waiting for a Steam game to launch");
@@ -214,6 +215,7 @@ fn run() -> Result<()> {
                             current_game = Some(name.clone());
                             current_game_pid = Some(pid);
                             last_frame_count = 0;
+                            last_unique_count = 0;
                             last_frame_check = Instant::now();
                             status_item.set_text(format!("Snapple \u{2014} Recording {name}"));
                             log("[snapple] capture started");
@@ -291,13 +293,15 @@ fn run() -> Result<()> {
         let should_restart = if let Some(ref session) = capture_session {
             let restart = session.needs_restart(
                 last_frame_count,
+                last_unique_count,
                 last_frame_check,
             );
             if restart {
-                log("[snapple] capture needs restart (thread exited or frames stalled)");
+                log("[snapple] capture needs restart (thread dead or unique frame rate collapsed)");
             } else if last_frame_check.elapsed() >= Duration::from_secs(5) {
                 // Refresh bookkeeping for the next cycle.
                 last_frame_count = session.frame_count();
+                last_unique_count = session.unique_count();
                 last_frame_check = Instant::now();
             }
             restart
@@ -326,6 +330,7 @@ fn run() -> Result<()> {
                     Ok(new_session) => {
                         capture_session = Some(new_session);
                         last_frame_count = 0;
+                        last_unique_count = 0;
                         last_frame_check = Instant::now();
                         log(&format!("[snapple] capture restarted for {game_name}"));
                     }

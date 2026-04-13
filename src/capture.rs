@@ -32,6 +32,15 @@ pub struct CaptureSession {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     frame_counter: Arc<AtomicU64>,
+    /// Counts only *fresh* WGC frames (one tick per successful
+    /// downsample).  Pacing duplicates do not advance this counter, so it
+    /// is the right signal for detecting the WGC stale-swap-chain stall
+    /// where delivery silently drops from 60 Hz to DWM background rate
+    /// (~12 Hz) while `frame_counter` keeps advancing from duplicates.
+    unique_counter: Arc<AtomicU64>,
+    /// Target fps declared by the config — used by `needs_restart` to
+    /// judge whether unique delivery has collapsed below half of target.
+    target_fps: u64,
     /// Set to `true` by the capture thread once it enters the frame loop.
     /// Until then, stall detection is skipped (startup can take >10 s due
     /// to content-size probing and the audio-pipe handshake).
@@ -50,8 +59,11 @@ impl CaptureSession {
         let running_clone = running.clone();
         let frame_counter = Arc::new(AtomicU64::new(0));
         let frame_counter_clone = frame_counter.clone();
+        let unique_counter = Arc::new(AtomicU64::new(0));
+        let unique_counter_clone = unique_counter.clone();
         let warmup_done = Arc::new(AtomicBool::new(false));
         let warmup_done_clone = warmup_done.clone();
+        let target_fps = capture_cfg.fps;
 
         let thread = thread::Builder::new()
             .name("capture".into())
@@ -64,6 +76,7 @@ impl CaptureSession {
                     cleanup_age_secs,
                     game_pid,
                     frame_counter_clone,
+                    unique_counter_clone,
                     warmup_done_clone,
                 ) {
                     log(&format!("[snapple] capture error: {e:#}"));
@@ -75,6 +88,8 @@ impl CaptureSession {
             running,
             thread: Some(thread),
             frame_counter,
+            unique_counter,
+            target_fps,
             warmup_done,
         })
     }
@@ -82,6 +97,12 @@ impl CaptureSession {
     /// Number of video frames successfully captured (cumulative across pipeline restarts).
     pub fn frame_count(&self) -> u64 {
         self.frame_counter.load(Ordering::Relaxed)
+    }
+
+    /// Number of *fresh* WGC frames downsampled (no pacing duplicates).
+    /// Used for unique-rate collapse detection.
+    pub fn unique_count(&self) -> u64 {
+        self.unique_counter.load(Ordering::Relaxed)
     }
 
     /// Whether the capture thread is still running.
@@ -92,11 +113,24 @@ impl CaptureSession {
     /// Check whether the capture appears stalled.  Returns `true` when the
     /// caller should tear down this session and start a fresh one.
     ///
-    /// `last_frame_count` / `last_check` / `start_time` are the caller's
-    /// bookkeeping from the previous health-check cycle.
+    /// Two failure modes are detected:
+    ///
+    /// 1. **Total stall** — `frame_count` has not moved at all in the last
+    ///    window.  Catches the thread-dead / pipe-closed cases.
+    /// 2. **Unique-rate collapse** — the pipeline is still writing
+    ///    (duplicates for pacing), but fresh WGC frames are arriving at
+    ///    less than half of `target_fps`.  This is the classic
+    ///    stale-swap-chain stall: WGC's internal hook is attached to a
+    ///    swap chain the game has since recreated, so delivery falls to
+    ///    the DWM background rate (~12 Hz) and the clip looks like a 10
+    ///    fps slideshow even though the file is tagged 60 fps.
+    ///
+    /// The caller supplies the previous cycle's `frame_count` and
+    /// `unique_count` snapshots plus the wall-clock of the last check.
     pub fn needs_restart(
         &self,
         last_frame_count: u64,
+        last_unique_count: u64,
         last_check: Instant,
     ) -> bool {
         if !self.is_running() {
@@ -108,11 +142,22 @@ impl CaptureSession {
         if !self.warmup_done.load(Ordering::Relaxed) {
             return false;
         }
-        if last_check.elapsed() >= Duration::from_secs(5) {
-            self.frame_count() == last_frame_count
-        } else {
-            false
+        let elapsed = last_check.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return false;
         }
+        if self.frame_count() == last_frame_count {
+            return true;
+        }
+        // Unique-rate collapse: fewer than fps/2 unique frames per second
+        // across the window means WGC has stopped delivering at the real
+        // game rate.  We use half-target as the bar so that brief dips
+        // (loading screens, alt-tab) don't force a restart — only a
+        // sustained collapse does.
+        let unique_delta = self.unique_count().saturating_sub(last_unique_count);
+        let elapsed_secs = elapsed.as_secs_f64().max(1.0);
+        let unique_per_sec = unique_delta as f64 / elapsed_secs;
+        unique_per_sec < (self.target_fps as f64) / 2.0
     }
 
     pub fn stop(&mut self) {
@@ -131,6 +176,8 @@ impl CaptureSession {
             running: Arc::new(AtomicBool::new(true)),
             thread: None,
             frame_counter: Arc::new(AtomicU64::new(0)),
+            unique_counter: Arc::new(AtomicU64::new(0)),
+            target_fps: 60,
             warmup_done: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -150,6 +197,7 @@ fn capture_thread(
     cleanup_age_secs: u64,
     game_pid: u32,
     frame_counter: Arc<AtomicU64>,
+    unique_counter: Arc<AtomicU64>,
     warmup_done: Arc<AtomicBool>,
 ) -> Result<()> {
     unsafe {
@@ -185,7 +233,7 @@ fn capture_thread(
     let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        4, // larger pool to avoid dropping frames before we drain them
+        8, // larger pool to avoid dropping frames before we drain them
         size,
     )?;
     let session = frame_pool.CreateCaptureSession(&item)?;
@@ -449,6 +497,7 @@ fn capture_thread(
                                         downsample_bgra(src_ptr, pitch, &mut last_frame, lut);
                                         diag_downsample_total += downsample_start.elapsed();
                                         diag_unique_frames += 1;
+                                        unique_counter.fetch_add(1, Ordering::Relaxed);
 
                                         d3d_context.Unmap(&staging, 0);
                                         has_first_frame = true;
@@ -619,12 +668,22 @@ fn create_window_capture_item(
 
 fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     unsafe {
+        // Pick the hardware adapter with the largest dedicated VRAM.  On
+        // hybrid laptops this is the dGPU (NVIDIA/AMD discrete), which is
+        // where the game actually renders.  Without this, D3D11CreateDevice
+        // with a NULL adapter picks whichever adapter Windows enumerates
+        // first — often the iGPU — and WGC then has to cross-GPU copy
+        // every frame, which caps delivery around 10–15 fps even when the
+        // game is running at 80+ fps.
+        let adapter = select_capture_adapter()?;
+
         let mut device = None;
         let mut context = None;
 
+        // driver_type must be UNKNOWN when a specific adapter is supplied.
         D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
+            &adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             Some(&[D3D_FEATURE_LEVEL_11_0]),
@@ -638,6 +697,49 @@ fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
             device.context("No D3D11 device")?,
             context.context("No D3D11 context")?,
         ))
+    }
+}
+
+/// Enumerate DXGI adapters and return the hardware adapter with the
+/// largest `DedicatedVideoMemory` — on a hybrid laptop this is the dGPU
+/// (NVIDIA), which is where games actually render.  Software/WARP
+/// adapters are skipped so we never fall back to the basic render driver.
+fn select_capture_adapter() -> Result<IDXGIAdapter> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+
+        let mut best: Option<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> = None;
+        let mut idx = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(idx) {
+            idx += 1;
+            let desc = match adapter.GetDesc1() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                continue;
+            }
+            let take = best
+                .as_ref()
+                .is_none_or(|(_, b)| desc.DedicatedVideoMemory > b.DedicatedVideoMemory);
+            if take {
+                best = Some((adapter, desc));
+            }
+        }
+
+        let (adapter, desc) = best.context("No hardware DXGI adapter found")?;
+        let name_end = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..name_end]);
+        log(&format!(
+            "[snapple] capture adapter: {name} ({} MB VRAM)",
+            desc.DedicatedVideoMemory / (1024 * 1024),
+        ));
+
+        Ok(adapter.cast()?)
     }
 }
 
@@ -1776,7 +1878,7 @@ mod tests {
         session.running.store(false, Ordering::Relaxed);
 
         assert!(
-            session.needs_restart(0, Instant::now()),
+            session.needs_restart(0, 0, Instant::now()),
             "should restart when the capture thread is no longer running"
         );
     }
@@ -1789,7 +1891,7 @@ mod tests {
         let old_check = Instant::now() - Duration::from_secs(30);
 
         assert!(
-            !session.needs_restart(0, old_check),
+            !session.needs_restart(0, 0, old_check),
             "should not restart while warmup is still in progress"
         );
     }
@@ -1800,9 +1902,10 @@ mod tests {
         // warmup_done is true (set by dummy), last check was 6s ago, counter stuck at 100.
         let old_check = Instant::now() - Duration::from_secs(6);
         session.frame_counter.store(100, Ordering::Relaxed);
+        session.unique_counter.store(100, Ordering::Relaxed);
 
         assert!(
-            session.needs_restart(100, old_check),
+            session.needs_restart(100, 100, old_check),
             "should restart when frame count is stuck after warmup"
         );
     }
@@ -1811,11 +1914,13 @@ mod tests {
     fn no_restart_when_frames_advancing() {
         let session = CaptureSession::dummy();
         let old_check = Instant::now() - Duration::from_secs(6);
-        session.frame_counter.store(200, Ordering::Relaxed);
+        // 360 unique frames in 6s = 60 fps — well above the half-target bar.
+        session.frame_counter.store(500, Ordering::Relaxed);
+        session.unique_counter.store(460, Ordering::Relaxed);
 
         assert!(
-            !session.needs_restart(100, old_check),
-            "should not restart when frame count is advancing"
+            !session.needs_restart(100, 100, old_check),
+            "should not restart when unique frames are arriving at target rate"
         );
     }
 
@@ -1826,8 +1931,28 @@ mod tests {
         let recent_check = Instant::now(); // just checked
 
         assert!(
-            !session.needs_restart(0, recent_check),
+            !session.needs_restart(0, 0, recent_check),
             "should not restart before the 5-second check interval"
+        );
+    }
+
+    /// The WGC stale-swap-chain regression: frame_counter keeps advancing
+    /// from duplicate writes (60/sec), but unique delivery has collapsed
+    /// to ~12/sec.  `needs_restart` must catch this and trigger a full
+    /// session restart so the frame pool + capture item get rebuilt.
+    #[test]
+    fn restart_on_unique_rate_collapse() {
+        let session = CaptureSession::dummy();
+        let old_check = Instant::now() - Duration::from_secs(6);
+        // 360 total writes in 6s (60 fps) — looks healthy by frame_count.
+        session.frame_counter.store(460, Ordering::Relaxed);
+        // But only 72 unique frames in 6s (~12 fps) — collapsed.
+        session.unique_counter.store(172, Ordering::Relaxed);
+
+        assert!(
+            session.needs_restart(100, 100, old_check),
+            "should restart when unique delivery falls below half target fps, \
+             even while duplicate writes keep frame_count advancing"
         );
     }
 
