@@ -487,15 +487,23 @@ fn capture_thread(
                 // duplicate of `last_frame` injected to keep wall-clock pace.
                 diag_dup_writes += writes.saturating_sub(1);
 
-                if diag_last_report.elapsed() >= Duration::from_secs(1) {
+                let elapsed_diag = diag_last_report.elapsed();
+                if elapsed_diag >= Duration::from_secs(1) {
                     let avg_ms = if diag_unique_frames > 0 {
                         diag_downsample_total.as_secs_f64() * 1000.0
                             / diag_unique_frames as f64
                     } else {
                         0.0
                     };
+                    // Frames/sec actually pushed into the ffmpeg pipe over
+                    // this diag window.  If `wrote` drops noticeably below
+                    // `fps`, the encoder is back-pressuring the pipe and
+                    // the resulting clip will be sped up — see the
+                    // h264_amf profile comment in ENCODER_PROFILES.
+                    let wrote_total = diag_unique_frames + diag_dup_writes;
+                    let wrote_per_sec = wrote_total as f64 / elapsed_diag.as_secs_f64();
                     log(&format!(
-                        "[snapple] capture diag: avg downsample={avg_ms:.1}ms unique={diag_unique_frames} dup={diag_dup_writes}"
+                        "[snapple] capture diag: avg downsample={avg_ms:.1}ms unique={diag_unique_frames} dup={diag_dup_writes} wrote={wrote_per_sec:.0}/{fps}fps"
                     ));
                     diag_downsample_total = Duration::ZERO;
                     diag_unique_frames = 0;
@@ -1012,18 +1020,25 @@ const ENCODER_PROFILES: &[EncoderProfile] = &[
             "-level", "4.2",
         ],
     },
-    // AMD — `quality` is the slowest AMF preset.  preanalysis is the AMF
-    // analogue of motion lookahead; vbaq (variance-based adaptive
-    // quantization) is the analogue of spatial AQ.  B-frames omitted: AMF
-    // H.264 B-frame support is hardware-dependent and can fail to
-    // initialise on older Radeons.
+    // AMD — `balanced` preset, *no* preanalysis.  The earlier "quality
+    // preset + preanalysis" combo was tested on an integrated AMD GPU
+    // (THE FINALS, on battery, 22:34 session) and ran at ffmpeg
+    // `speed=0.78x` — i.e. ~47 fps wall-clock against a 60 fps target.
+    // That sustained back-pressure on the pipe makes the capture loop
+    // push frames slower than real-time, but the file is still tagged
+    // `-r 60`, so the result is a clip that plays ~1.3× sped up.  Stay
+    // at `balanced` (which historically held `speed=0.999x` on the same
+    // hardware) and skip preanalysis (the dominant per-frame cost),
+    // keeping only the cheap quality wins: vbaq (variance-based AQ),
+    // high profile (CABAC + 8x8 transforms — essentially free at the
+    // encoder, real bitrate efficiency win), and level 4.2.  B-frames
+    // omitted: AMF H.264 B-frame support is hardware-dependent.
     EncoderProfile {
         encoder: "h264_amf",
-        preset: "quality",
+        preset: "balanced",
         rate_control: "cqp",
         quality: "16",
         extra: &[
-            "-preanalysis", "true",
             "-vbaq", "true",
             "-profile:v", "high",
             "-level", "4.2",
@@ -1280,7 +1295,7 @@ fn drain_ffmpeg_stderr(child: &mut Child) {
 mod tests {
     use super::{
         build_ffmpeg_args, choose_monitor_target, compute_output_dims, downsample_bgra,
-        frame_interval, AudioInput, CaptureSession, DownsampleLut,
+        frame_interval, AudioInput, CaptureSession, DownsampleLut, ENCODER_PROFILES,
     };
     use crate::config::CaptureConfig;
     use std::path::Path;
@@ -1381,6 +1396,43 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-rc-lookahead", "32"]));
         assert!(args.windows(2).any(|w| w == ["-bf", "3"]));
         assert!(args.windows(2).any(|w| w == ["-b_ref_mode", "middle"]));
+    }
+
+    #[test]
+    fn ffmpeg_args_amf_profile_stays_realtime() {
+        // Regression guard for the 22:34 sped-up-clip incident: the AMF
+        // profile must not enable preanalysis or the slow `quality`
+        // preset on the matrix's default entry — they pushed integrated
+        // AMD GPUs below real-time and produced ~1.3× sped-up clips.
+        // Keep the cheap quality wins (vbaq, high profile, level 4.2).
+        let mut cfg = CaptureConfig::default();
+        cfg.encoder = "h264_amf".into();
+        // Use the matrix's own values so the test fails if the profile
+        // entry's preset/rc/quality change.
+        let amf = ENCODER_PROFILES
+            .iter()
+            .find(|p| p.encoder == "h264_amf")
+            .expect("h264_amf profile must exist");
+        cfg.preset = amf.preset.into();
+        cfg.rate_control = amf.rate_control.into();
+        cfg.quality = amf.quality.into();
+
+        let args = build_ffmpeg_args(1280, 720, Path::new("C:/temp"), &cfg, None);
+
+        // Cheap quality wins must be present.
+        assert!(args.windows(2).any(|w| w == ["-vbaq", "true"]));
+        assert!(args.windows(2).any(|w| w == ["-profile:v", "high"]));
+        assert!(args.windows(2).any(|w| w == ["-level", "4.2"]));
+
+        // Expensive flags that broke real-time on integrated AMD must NOT come back.
+        assert!(
+            !args.iter().any(|a| a == "-preanalysis"),
+            "preanalysis must stay disabled — it pushed AMF below 60fps real-time"
+        );
+        assert!(
+            !args.windows(2).any(|w| w == ["-preset", "quality"]),
+            "AMF preset must not be `quality` — too slow on integrated AMD"
+        );
     }
 
     #[test]
